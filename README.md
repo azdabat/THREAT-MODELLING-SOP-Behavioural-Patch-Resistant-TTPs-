@@ -261,7 +261,7 @@ The SOP is designed to meet expectations at a senior professional level and demo
 
 ---
 
-# 8. Repository Structure
+# 8. Initial Repository Structure (To be expanded)
 
 ```plaintext
 THREAT-MODELLING-SOP/
