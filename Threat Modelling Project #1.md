@@ -232,7 +232,7 @@ These patterns form your **core hunts**.
 ---
 
 # 9. Summary – How to Use This SOP  
-You now have a **complete attacker-first threat model** for all major behavioural threat categories in 2025:
+**complete attacker-first threat model** for a few major behavioural threat categories in 2025:
 
 - Human-operated ransomware  
 - Identity takeover  
@@ -248,4 +248,4 @@ Each includes:
 - Detection hypotheses  
 - Pivot tables for hunts  
 
-This gives you everything needed to now build your **core hunt pack** and later your **advanced scoring-based engine**.
+see: **core hunt pack** and **advanced scoring-based engine**.
