@@ -1,0 +1,205 @@
+// ============================================================================
+//  Image-Based Stego Loader (HTML Smuggling / PNG/JPEG Payloads)
+// Author: Ala Dabat
+// Version: 2025-12 (Core Hunt)
+// Purpose:
+//   Hunt for steganography-style loaders where a user-facing app spawns a
+//   script/LOLBin that reads an image from Downloads/Temp and then makes
+//   outbound network connections shortly after.
+// 
+// MITRE:
+//   TA0001 Initial Access      : T1566.001 (Spearphishing Attachment)
+//   TA0002 Execution           : T1059 (Command & Scripting Interpreter)
+//   TA0005 Defense Evasion     : T1027.003 (Steganography / Obfuscated Content)
+//   TA0011 Command & Control   : T1071.001 (HTTPS C2)
+// 
+// Notes (Core Hunt, not Advanced):
+//   - Behaviour-only, no hash or CTI dependencies
+//   - Light scoring + HunterDirective to help triage
+//   - Designed as a low-volume, high-suspicion hunting query, not an alert rule
+// ============================================================================
+
+let lookback = 7d;
+let TimeWindowMinutes = 5;
+
+// User-facing parents (where the lure is likely opened)
+let UserFacingParents = dynamic([
+    "outlook.exe","winword.exe","excel.exe","powerpnt.exe",
+    "chrome.exe","msedge.exe","iexplore.exe","firefox.exe"
+]);
+
+// Script / LOLBin-style loaders typically abused here
+let ScriptHosts = dynamic([
+    "powershell.exe","pwsh.exe",
+    "wscript.exe","cscript.exe",
+    "mshta.exe","rundll32.exe"
+]);
+
+// Image extensions commonly abused for stego
+let ImageExt = dynamic([".png",".jpg",".jpeg",".bmp",".gif"]);
+
+// Simple suspicious TLD/IP heuristics (core, not advanced TI)
+let SuspiciousTlds = dynamic([".xyz",".top",".club",".live",".cfd",".cam",".monster",".zip",".mov"]);
+let SuspiciousIpPrefixes = dynamic(["185.","45.","176.","194."]);
+
+// 1) Script / LOLBin spawned from user-facing app
+let ScriptFromUserApps =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName in~ (ScriptHosts)
+| where InitiatingProcessFileName in~ (UserFacingParents)
+| project
+    ScriptTime      = Timestamp,
+    DeviceId,
+    DeviceName,
+    AccountName,
+    ScriptFile      = FileName,
+    ScriptCommand   = ProcessCommandLine,
+    ParentImage     = InitiatingProcessFileName,
+    ProcessId;
+
+// 2) That same process reading image files from Downloads / Temp / browser caches
+let ImageReadsByScript =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("FileRead","FileCreated","FileModified")
+| extend FileExt = tolower(strcat(".", split(FileName, ".")[-1]))
+| where FileExt in~ (ImageExt)
+| where FolderPath has_any ("\\Downloads\\","\\Download\\","\\Temp\\","\\AppData\\Local\\Temp\\")
+| project
+    ImageReadTime = Timestamp,
+    DeviceId,
+    InitiatingProcessId,
+    ImageFile      = FileName,
+    ImageFolder    = FolderPath;
+
+// 3) Same script process then making outbound network calls shortly afterwards
+let NetFromScript =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where RemotePort in (80,443)
+| project
+    NetTime         = Timestamp,
+    DeviceId,
+    InitiatingProcessId,
+    RemoteIP,
+    RemoteUrl,
+    RemotePort;
+
+// 4) Correlate: ScriptFromUserApps → ImageReads → Network connections (within time window)
+ScriptFromUserApps
+| join kind=inner (
+    ImageReadsByScript
+) on DeviceId, ProcessId == InitiatingProcessId
+| where ImageReadTime between (ScriptTime - 2m .. ScriptTime + TimeWindowMinutes * 1m)
+| join kind=inner (
+    NetFromScript
+) on DeviceId, ProcessId == InitiatingProcessId
+| where NetTime between (ImageReadTime .. ImageReadTime + TimeWindowMinutes * 1m)
+
+// 5) Basic scoring logic (core, not advanced)
+//    - Start at 40 (already suspicious chain)
+//    - +10 if parent is Outlook/Office (email/document lure)
+//    - +10 if ScriptHost is mshta.exe or rundll32.exe (commonly abused loaders)
+//    - +10 if RemoteUrl uses suspicious TLD
+//    - +10 if RemoteIP starts with suspicious ASN ranges
+//    - +5  if multiple images read by same process (loop decoding / staged payload)
+| summarize
+    FirstSeen       = min(ScriptTime),
+    LastSeen        = max(NetTime),
+    ParentImage     = any(ParentImage),
+    ScriptFile      = any(ScriptFile),
+    ScriptCommand   = any(ScriptCommand),
+    DeviceName      = any(DeviceName),
+    AccountName     = any(AccountName),
+    ImageFiles      = make_set(ImageFile, 10),
+    ImageFolders    = make_set(ImageFolder, 10),
+    RemoteIPs       = make_set(RemoteIP, 10),
+    RemoteUrls      = make_set(RemoteUrl, 10),
+    RemotePorts     = make_set(RemotePort, 10),
+    ImageReadCount  = dcount(ImageFile)
+  by DeviceId
+
+| extend
+    HasSuspiciousTld = array_length(
+        array_filter(RemoteUrls, (u:string) {
+            let u_low = tolower(u);
+            SuspiciousTlds
+            | where u_low endswith tostring(SuspiciousTlds[item()])
+        })
+    ) > 0,
+
+    HasSuspiciousIp  = array_length(
+        array_filter(RemoteIPs, (ip:string) {
+            SuspiciousIpPrefixes
+            | where ip startswith tostring(SuspiciousIpPrefixes[item()])
+        })
+    ) > 0,
+
+    FromOfficeParent = iif(ParentImage in~ ("outlook.exe","winword.exe","excel.exe","powerpnt.exe"), true, false),
+    HighAbuseHost    = iif(ScriptFile in~ ("mshta.exe","rundll32.exe"), true, false)
+
+| extend
+    BaseScore    = 40,
+    Score_Parent = iif(FromOfficeParent, 10, 0),
+    Score_Host   = iif(HighAbuseHost, 10, 0),
+    Score_Tld    = iif(HasSuspiciousTld, 10, 0),
+    Score_Ip     = iif(HasSuspiciousIp, 10, 0),
+    Score_Images = iif(ImageReadCount >= 3, 5, 0)
+| extend
+    RiskScore = BaseScore + Score_Parent + Score_Host + Score_Tld + Score_Ip + Score_Images,
+    RiskLevel = case(
+        RiskScore >= 75, "Critical",
+        RiskScore >= 60, "High",
+        RiskScore >= 50, "Medium",
+        "Low"
+    )
+
+// 6) Hunter directives (core-level guidance)
+| extend HunterDirective = case(
+    RiskLevel == "Critical",
+        strcat(
+            "CRITICAL: Likely stego-based loader chain. ",
+            "User-facing app (", ParentImage, ") spawned ", ScriptFile,
+            " which read image(s) from ", tostring(ImageFolders),
+            " then called remote endpoint(s) ", tostring(RemoteUrls),
+            ". Isolate endpoint, capture full memory image, and review recent email/HTML lures. "
+            "Check for in-memory .NET loaders / RATs (e.g. XWorm, Lumma)."
+        ),
+    RiskLevel == "High",
+        strcat(
+            "HIGH: Suspicious script host (", ScriptFile, ") from ", ParentImage,
+            " reading image(s) from ", tostring(ImageFolders),
+            " then reaching out to ", tostring(RemoteUrls),
+            ". Pivot into EmailEvents and browser history for stego/HTML smuggling lures. ",
+            "If confirmed malicious, block domains/IPs and review similar activity across fleet."
+        ),
+    RiskLevel == "Medium",
+        strcat(
+            "MEDIUM: Image-reading script activity from user-facing app. ",
+            "Review process chain and remote endpoints for signs of loader behaviour. ",
+            "May be noisy in dev/test environments; consider whitelisting known automation."
+        ),
+    "LOW: Stego-loader pattern partially matched (image + script), but no strong C2 indicators. Baseline and tune."
+)
+
+// 7) Surface only medium+ for core hunt outputs (you can lower this to see more)
+| where RiskLevel in ("Medium","High","Critical")
+| project
+    FirstSeen,
+    LastSeen,
+    DeviceName,
+    AccountName,
+    ParentImage,
+    ScriptFile,
+    ScriptCommand,
+    ImageFiles,
+    ImageFolders,
+    RemoteIPs,
+    RemoteUrls,
+    RemotePorts,
+    ImageReadCount,
+    RiskScore,
+    RiskLevel,
+    HunterDirective
+| order by RiskScore desc, LastSeen desc
