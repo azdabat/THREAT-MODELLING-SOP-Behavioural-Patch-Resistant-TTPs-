@@ -1,0 +1,153 @@
+//////////////////////////////////////////////////////////////////////////////////
+// Core Hunt: SilverFox_ValleyRat_Sideload_BYOVD_Core
+// Author: Ala Dabat
+// Version: 2025-12
+// Purpose:
+//   Behavioural correlation hunt for SilverFox/ValleyRat-style chains where a
+//   signed / legitimate loader performs DLL sideloading, drops a vulnerable
+//   driver into a user-writable directory, and then creates a kernel-mode
+//   service pointing at that driver.
+//
+// Tactics:
+//   - Defense Evasion, Privilege Escalation, Persistence
+//
+// Techniques (MITRE):
+//   - T1574.002  (DLL Side-Loading)
+//   - T1204.002  (User Execution: Malicious File)
+//   - T1543.003  (Create or Modify System Process: Windows Service)
+//   - T1547      (Persistence via Services / Drivers)
+//   - T1562.001  (Disable or Modify Tools) – implied in downstream activity
+//////////////////////////////////////////////////////////////////////////////////
+
+let Lookback = 24h;
+let DriverPaths = dynamic(["\\Temp\\","\\ProgramData\\","\\Users\\","\\Public\\"]);
+
+// 1) Sideloading precursor: Legit loader in Program Files loading DLL from user-writable locations
+let SideloadEvents =
+DeviceImageLoadEvents
+| where Timestamp > ago(Lookback)
+| where InitiatingProcessFolderPath has_any ("\\Program Files\\","\\Program Files (x86)\\")
+| where FolderPath has_any (DriverPaths)            // DLL loaded from user-writable directory
+| where not(FolderPath has_any ("\\Windows\\","\\Microsoft\\")) // exclude normal system paths
+| project
+    DeviceId,
+    SideloadTime = Timestamp,
+    LoaderName   = InitiatingProcessFileName,
+    LoaderPath   = InitiatingProcessFolderPath,
+    LoadedDll    = FileName,
+    LoadedDllPath= FolderPath;
+
+// 2) Driver drop: .sys written into user-writable directory
+let DriverDrops =
+DeviceFileEvents
+| where Timestamp > ago(Lookback)
+| where FileName endswith ".sys"
+| where FolderPath has_any (DriverPaths)
+| extend DriverFullPath = strcat(FolderPath, "\\", FileName)
+| project
+    DeviceId,
+    DropTime = Timestamp,
+    DriverFile = FileName,
+    DriverFolder = FolderPath,
+    DriverFullPath,
+    Dropper = InitiatingProcessFileName;
+
+// 3) Driver load: kernel service created pointing to dropped .sys
+let DriverServiceCreates =
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| where FileName in~ ("sc.exe","pnputil.exe")
+| where ProcessCommandLine has_any (".sys",".inf")
+| where ProcessCommandLine has_any (DriverPaths)
+| project
+    DeviceId,
+    LoadTime = Timestamp,
+    ServiceCmd = ProcessCommandLine,
+    LoaderProc = FileName;
+
+// 4) Correlate Sideload -> Drop -> Service Create on same device within ordered time windows
+SideloadEvents
+| join kind=inner (DriverDrops) on DeviceId
+    // driver drop shortly after sideload event
+    | where DropTime between (SideloadTime .. SideloadTime + 30m)
+| join kind=inner (DriverServiceCreates) on DeviceId
+    // service create shortly after driver drop
+    | where LoadTime between (DropTime .. DropTime + 15m)
+
+// 5) Aggregate into one story per device
+| summarize
+    FirstSeen        = min(SideloadTime),
+    LastSeen         = max(LoadTime),
+    LoaderName       = any(LoaderName),
+    LoaderPath       = any(LoaderPath),
+    LoadedDlls       = make_set(LoadedDll, 10),
+    LoadedDllPaths   = make_set(LoadedDllPath, 10),
+    DriverFiles      = make_set(DriverFile, 10),
+    DriverFolders    = make_set(DriverFolder, 10),
+    ServiceCmds      = make_set(ServiceCmd, 10),
+    Droppers         = make_set(Dropper, 10),
+    LoaderProcs      = make_set(LoaderProc, 10),
+    SideloadEventCnt = dcount(LoadedDll),
+    DriverDropCnt    = dcount(DriverFile)
+  by DeviceId
+
+// 6) Scoring – light, non-redundant, focused on unique value
+| extend
+    BaseScore        = 40,
+    Score_MultiDll   = iif(SideloadEventCnt >= 3, 5, 0),          // repeated odd DLL loads
+    Score_MultiDrv   = iif(DriverDropCnt   >= 2, 5, 0),          // multiple drivers dropped
+    Score_TempPath   = iif(array_length(DriverFolders) > 0
+                            and tostring(DriverFolders) has "\\Temp\\", 5, 0),
+    Score_ProgramData= iif(tostring(DriverFolders) has "\\ProgramData\\", 5, 0),
+    RiskScore        = BaseScore + Score_MultiDll + Score_MultiDrv + Score_TempPath + Score_ProgramData,
+    RiskLevel        = case(
+        RiskScore >= 75, "Critical",
+        RiskScore >= 60, "High",
+        RiskScore >= 50, "Medium",
+        "Low"
+    )
+
+// 7) Core hunter directive – concise but actionable
+| extend HunterDirective = case(
+    RiskLevel == "Critical",
+        strcat(
+            "CRITICAL: Likely SilverFox/ValleyRat-style BYOVD chain. Loader (",
+            LoaderName, ") from ", LoaderPath,
+            " sideloaded DLL(s) from ", tostring(LoadedDllPaths),
+            " and dropped driver(s) ", tostring(DriverFiles),
+            " into ", tostring(DriverFolders),
+            " with kernel service creation in ServiceCmds. Isolate host, acquire full disk + memory,",
+            " and confirm driver signature/timestamp against vendor baselines."
+        ),
+    RiskLevel == "High",
+        strcat(
+            "HIGH: Sideloading + driver service creation sequence detected. Review loader ",
+            LoaderName, " and dropped driver(s) ", tostring(DriverFiles),
+            ". Validate if any driver is a known vulnerable BYOVD component and check for security tool tampering."
+        ),
+    RiskLevel == "Medium",
+        "MEDIUM: Sideloading behaviour chained with driver service creation on user-writable path. Baseline for legitimate software deployment; if none expected, escalate for manual review.",
+    "LOW: SilverFox/ValleyRat core pattern partially present; keep for hunting but not alerting."
+)
+
+// 8) Core hunt output – show Medium+ by default
+| where RiskLevel in ("Medium","High","Critical")
+| project
+    FirstSeen,
+    LastSeen,
+    DeviceId,
+    LoaderName,
+    LoaderPath,
+    LoadedDlls,
+    LoadedDllPaths,
+    DriverFiles,
+    DriverFolders,
+    ServiceCmds,
+    Droppers,
+    LoaderProcs,
+    SideloadEventCnt,
+    DriverDropCnt,
+    RiskScore,
+    RiskLevel,
+    HunterDirective
+| order by RiskScore desc, LastSeen desc
