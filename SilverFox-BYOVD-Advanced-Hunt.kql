@@ -4,8 +4,8 @@
 // Version: 2025-12
 // Purpose:
 //   High-context hunt for SilverFox / ValleyRat activity across the full chain:
-//   - DLL sideloading via legitimate loaders
-//   - BYOVD driver drop + service creation
+//   - DLL sideloading via legitimate or fake loaders
+//   - BYOVD driver drop + optional service creation
 //   - Security product tampering (fltmc / WinDefend)
 //   - Credential access and keylogger service patterns
 //   - Lateral movement (WMI/PowerShell remoting)
@@ -19,13 +19,20 @@
 let Lookback = 48h;
 let SuspiciousPaths = dynamic(["\\Temp\\","\\ProgramData\\","\\Users\\","\\Public\\"]);
 
-// 1) Sideloading surface: Legit loaders in Program Files loading DLLs from user-writable dirs
+// 1) Sideloading surface:
+//    - Loader in Program Files loading DLL from suspicious path
+//    - OR loader in suspicious path with DLL from the same directory (fake installer / self-sideload)
 let SideloadEvents =
 DeviceImageLoadEvents
 | where Timestamp > ago(Lookback)
-| where InitiatingProcessFolderPath has_any ("\\Program Files\\","\\Program Files (x86)\\")
-| where FolderPath has_any (SuspiciousPaths)
-| where not(FolderPath has_any ("\\Windows\\","\\Microsoft\\"))
+| where FolderPath has_any (SuspiciousPaths)                                // DLL from user-writable path
+| where not(FolderPath has_any ("\\Windows\\","\\Microsoft\\"))             // avoid system DLL noise
+| where
+    // Case 1: Program Files loader
+    (InitiatingProcessFolderPath has_any ("\\Program Files\\","\\Program Files (x86)\\")) or
+    // Case 2: Loader in suspicious path, DLL alongside it (same folder tree)
+    (InitiatingProcessFolderPath has_any (SuspiciousPaths)
+        and FolderPath startswith InitiatingProcessFolderPath)
 | project
     DeviceId,
     SideloadTime = Timestamp,
@@ -126,13 +133,27 @@ DeviceProcessEvents
     ExfilProc = FileName,
     ExfilCmd  = ProcessCommandLine;
 
-// 8) Build core BYOVD spine: Sideload -> DriverDrop -> DriverLoad
+// 8) Registry persistence (Run / RunOnce pointing into suspicious paths)
+let RegistryPersistence = 
+DeviceRegistryEvents
+| where Timestamp > ago(Lookback)
+| where ActionType == "RegistryValueSet"
+| where RegistryKey has_any ("\\CurrentVersion\\Run","\\CurrentVersion\\RunOnce")
+| where RegistryValueData has_any (SuspiciousPaths)
+| project
+    DeviceId,
+    RegTime  = Timestamp,
+    RegKey   = RegistryKey,
+    RegValue = RegistryValueData;
+
+// 9) Build core BYOVD spine: Sideload -> DriverDrop -> optional DriverLoad
 let CoreChain =
 SideloadEvents
 | join kind=inner (DriverDrops) on DeviceId
     | where DropTime between (SideloadTime .. SideloadTime + 30m)
-| join kind=inner (DriverLoads) on DeviceId
-    | where LoadTime between (DropTime .. DropTime + 20m)
+// Driver load is now optional (left join) – chain still valid without service creation
+| join kind=leftouter (DriverLoads) on DeviceId
+    | where isnull(LoadTime) or LoadTime between (DropTime .. DropTime + 20m)
 | project
     DeviceId,
     SideloadTime,
@@ -149,18 +170,19 @@ SideloadEvents
     ServiceCmd,
     ServiceProc;
 
-// 9) Enrich BYOVD spine with tampering, creds, lateral, and exfil on same device
+// 10) Enrich BYOVD spine with tampering, creds, lateral, registry, staging, and exfil on same device
 CoreChain
-| join kind=leftouter (SecurityTamper)   on DeviceId
-| join kind=leftouter (CredAndKeylog)    on DeviceId
-| join kind=leftouter (LateralMovement)  on DeviceId
-| join kind=leftouter (DataStaging)      on DeviceId
-| join kind=leftouter (Exfiltration)     on DeviceId
+| join kind=leftouter (SecurityTamper)       on DeviceId
+| join kind=leftouter (CredAndKeylog)        on DeviceId
+| join kind=leftouter (LateralMovement)      on DeviceId
+| join kind=leftouter (DataStaging)          on DeviceId
+| join kind=leftouter (Exfiltration)         on DeviceId
+| join kind=leftouter (RegistryPersistence)  on DeviceId
 
-// 10) Aggregate all signals into a single incident view per device
+// 11) Aggregate all signals into a single incident view per device
 | summarize
     FirstSeen         = min(SideloadTime),
-    LastSeen          = max(coalesce(ExfilTime, StageTime, LatTime, CredTime, TamperTime, LoadTime)),
+    LastSeen          = max(coalesce(ExfilTime, StageTime, LatTime, CredTime, TamperTime, LoadTime, RegTime)),
     LoaderName        = any(LoaderName),
     LoaderPath        = any(LoaderPath),
     LoadedDlls        = make_set(LoadedDll, 10),
@@ -176,27 +198,33 @@ CoreChain
     LatCmds           = make_set(LatCmd, 10),
     StageCmds         = make_set(StageCmd, 10),
     ExfilCmds         = make_set(ExfilCmd, 10),
+    RegKeys           = make_set(RegKey, 10),
+    RegValues         = make_set(RegValue, 10),
     SideloadCount     = dcount(LoadedDll),
     DriverDropCount   = dcount(DriverFile),
     TamperCount       = dcount(TamperCmd),
     CredEventCount    = dcount(CredCmd),
     LatMoveCount      = dcount(LatCmd),
     StageEventCount   = dcount(StageCmd),
-    ExfilEventCount   = dcount(ExfilCmd)
+    ExfilEventCount   = dcount(ExfilCmd),
+    RegEventCount     = dcount(RegKey)
   by DeviceId
 
-// 11) Advanced risk model – each dimension adds genuinely new information
+// 12) Advanced risk model – each dimension adds genuinely new information
 | extend
     BaseScore      = 40,
     Score_Sideload = iif(SideloadCount   >= 2, 5, 0),
-    Score_Drivers  = iif(DriverDropCount >= 2, 5, 0),
+    Score_Drivers  = iif(DriverDropCount >= 1, 5, 0),
+    Score_Service  = iif(array_length(ServiceCmds) > 0, 5, 0),
     Score_Tamper   = iif(TamperCount     > 0, 10, 0),   // security tools hit
     Score_Creds    = iif(CredEventCount  > 0, 10, 0),   // browser / keylogger signals
     Score_Lateral  = iif(LatMoveCount    > 0, 10, 0),
     Score_Stage    = iif(StageEventCount > 0, 5, 0),
     Score_Exfil    = iif(ExfilEventCount > 0, 10, 0),
-    RiskScore      = BaseScore + Score_Sideload + Score_Drivers + Score_Tamper
-                                  + Score_Creds + Score_Lateral + Score_Stage + Score_Exfil,
+    Score_RegPersist = iif(RegEventCount > 0, 10, 0),
+    RiskScore      = BaseScore + Score_Sideload + Score_Drivers + Score_Service
+                                  + Score_Tamper + Score_Creds + Score_Lateral
+                                  + Score_Stage + Score_Exfil + Score_RegPersist,
     RiskLevel      = case(
         RiskScore >= 85, "Critical",
         RiskScore >= 70, "High",
@@ -204,31 +232,30 @@ CoreChain
         "Low"
     )
 
-// 12) Hunter directives – tuned to full-chain vs partial-chain
+// 13) Hunter directives – tuned to full-chain vs partial-chain
 | extend HunterDirective = case(
     RiskLevel == "Critical",
         strcat(
-            "CRITICAL: Full SilverFox/ValleyRat kill-chain suspected. Loader ",
+            "CRITICAL: Full or near-full SilverFox/ValleyRat kill-chain suspected. Loader ",
             LoaderName, " from ", LoaderPath,
             " sideloaded DLL(s) from ", tostring(LoadedDllPaths),
-            " and loaded driver(s) ", tostring(DriverFullPaths),
-            " via service commands ", tostring(ServiceCmds),
+            " and dropped driver(s) ", tostring(DriverFullPaths),
+            " with service commands ", tostring(ServiceCmds),
             ". Security tampering: ", iif(TamperCount > 0, "YES", "NO"),
             "; credential/keylogger activity: ", iif(CredEventCount > 0, "YES", "NO"),
+            "; registry persistence: ", iif(RegEventCount > 0, "YES", "NO"),
             "; lateral movement: ", iif(LatMoveCount > 0, "YES", "NO"),
             "; staging/exfil: ", iif(ExfilEventCount > 0, "YES", "NO"),
-            ". Isolate host, collect full forensic image, and review BYOVD driver against vendor baseline. Treat as espionage-grade intrusion."
+            ". Isolate host, collect full forensic image, validate driver timestamps (byte-flip), and treat as espionage-grade intrusion."
         ),
     RiskLevel == "High",
-        strcat(
-            "HIGH: Strong SilverFox/ValleyRat-like BYOVD pattern. Sideloading + driver service creation present with one or more of: security tampering, credential theft, lateral movement, or data staging. Prioritise for manual investigation and cross-host hunting."
-        ),
+        "HIGH: Strong SilverFox/ValleyRat-like BYOVD/RAT pattern with one or more of: tamper, credential theft, registry persistence, lateral movement, or exfiltration. Prioritise for manual investigation and cross-host scoping.",
     RiskLevel == "Medium",
-        "MEDIUM: BYOVD-like activity with partial follow-on behaviours. Validate whether any legitimate software deployment matches this pattern before suppression.",
-    "LOW: Core BYOVD chain exists but without strong supporting signals; useful for hunting, not alerting."
+        "MEDIUM: BYOVD-like activity with partial follow-on behaviours. Baseline for legitimate installers or driver deployments before tuning; escalate if no expected software matches this behaviour.",
+    "LOW: Core SilverFox pattern partially present; useful for hunting but not for alerting."
 )
 
-// 13) Advanced hunt output – surface Medium+ by default
+// 14) Advanced hunt output – surface Medium+ by default
 | where RiskLevel in ("Medium","High","Critical")
 | project
     FirstSeen,
@@ -248,6 +275,8 @@ CoreChain
     LatCmds,
     StageCmds,
     ExfilCmds,
+    RegKeys,
+    RegValues,
     SideloadCount,
     DriverDropCount,
     TamperCount,
@@ -255,6 +284,7 @@ CoreChain
     LatMoveCount,
     StageEventCount,
     ExfilEventCount,
+    RegEventCount,
     RiskScore,
     RiskLevel,
     HunterDirective
