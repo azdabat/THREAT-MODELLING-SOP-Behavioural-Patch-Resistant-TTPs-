@@ -18,136 +18,87 @@
 //   - T1547      (Persistence via Services / Drivers)
 //   - T1562.001  (Disable or Modify Tools) – implied in downstream activity
 //////////////////////////////////////////////////////////////////////////////////
+// Logic: Signed Loader (User Path) -> Sideload -> Driver Drop -> Service Install (Process or Registry)
+// 1. Signed EXE in user-writable path loads DLL from same path.
+// 2. Writes .sys/.dat driver file.
+// 3. Creates Kernel Service via SC.exe or Registry manipulation.
 
 let Lookback = 24h;
-let DriverPaths = dynamic(["\\Temp\\","\\ProgramData\\","\\Users\\","\\Public\\"]);
+let WritablePaths = dynamic(["\\Temp\\","\\ProgramData\\","\\Users\\","\\Public\\","\\Desktop\\","\\Downloads\\"]);
 
-// 1) Sideloading precursor: Legit loader in Program Files loading DLL from user-writable locations
+// 1) SIDELOAD: Signed Loader in User Path loading DLL from User Path
 let SideloadEvents =
 DeviceImageLoadEvents
 | where Timestamp > ago(Lookback)
-| where InitiatingProcessFolderPath has_any ("\\Program Files\\","\\Program Files (x86)\\")
-| where FolderPath has_any (DriverPaths)            // DLL loaded from user-writable directory
-| where not(FolderPath has_any ("\\Windows\\","\\Microsoft\\")) // exclude normal system paths
+| where FileName endswith ".dll"
+| where InitiatingProcessFolderPath has_any (WritablePaths)
+| where FolderPath has_any (WritablePaths)
+| where InitiatingProcessSignatureStatus == "Signed" 
 | project
     DeviceId,
     SideloadTime = Timestamp,
     LoaderName   = InitiatingProcessFileName,
     LoaderPath   = InitiatingProcessFolderPath,
+    LoaderPid    = InitiatingProcessId,
     LoadedDll    = FileName,
     LoadedDllPath= FolderPath;
 
-// 2) Driver drop: .sys written into user-writable directory
+// 2) DRIVER DROP: Driver file written to user path
 let DriverDrops =
 DeviceFileEvents
 | where Timestamp > ago(Lookback)
-| where FileName endswith ".sys"
-| where FolderPath has_any (DriverPaths)
-| extend DriverFullPath = strcat(FolderPath, "\\", FileName)
+| where FileName has_any (".sys", ".dat", ".tmp")
+| where FolderPath has_any (WritablePaths)
 | project
     DeviceId,
     DropTime = Timestamp,
     DriverFile = FileName,
     DriverFolder = FolderPath,
-    DriverFullPath,
-    Dropper = InitiatingProcessFileName;
+    DropperPid = InitiatingProcessId;
 
-// 3) Driver load: kernel service created pointing to dropped .sys
-let DriverServiceCreates =
+// 3) SERVICE CREATION: Catch both SC.exe commands and direct Registry API calls
+let ServiceRegistry = 
+DeviceRegistryEvents
+| where Timestamp > ago(Lookback)
+| where RegistryKey has "System\\CurrentControlSet\\Services"
+| where RegistryValueName == "ImagePath"
+| where RegistryValueData has ".sys" and RegistryValueData has_any (WritablePaths)
+| project DeviceId, LoadTime=Timestamp, ServiceCmd=RegistryKey, LoaderPid=InitiatingProcessId, Method="Registry";
+
+let ServiceProcess =
 DeviceProcessEvents
 | where Timestamp > ago(Lookback)
-| where FileName in~ ("sc.exe","pnputil.exe")
-| where ProcessCommandLine has_any (".sys",".inf")
-| where ProcessCommandLine has_any (DriverPaths)
-| project
-    DeviceId,
-    LoadTime = Timestamp,
-    ServiceCmd = ProcessCommandLine,
-    LoaderProc = FileName;
+| where FileName in~ ("sc.exe", "pnputil.exe")
+| where ProcessCommandLine has ".sys" and ProcessCommandLine has_any (WritablePaths)
+| project DeviceId, LoadTime=Timestamp, ServiceCmd=ProcessCommandLine, LoaderPid=InitiatingProcessId, Method="Process";
 
-// 4) Correlate Sideload -> Drop -> Service Create on same device within ordered time windows
+let DriverServiceCreates = union ServiceRegistry, ServiceProcess;
+
+// 4) CORRELATION CHAIN
 SideloadEvents
+// Join Drop on Device (Time: Sideload -> +45m)
 | join kind=inner (DriverDrops) on DeviceId
-    // driver drop shortly after sideload event
-    | where DropTime between (SideloadTime .. SideloadTime + 30m)
+    | where DropTime between (SideloadTime .. SideloadTime + 45m)
+// Join Service Create on Device (Time: Drop -> +15m)
 | join kind=inner (DriverServiceCreates) on DeviceId
-    // service create shortly after driver drop
     | where LoadTime between (DropTime .. DropTime + 15m)
 
-// 5) Aggregate into one story per device
-| summarize
-    FirstSeen        = min(SideloadTime),
-    LastSeen         = max(LoadTime),
-    LoaderName       = any(LoaderName),
-    LoaderPath       = any(LoaderPath),
-    LoadedDlls       = make_set(LoadedDll, 10),
-    LoadedDllPaths   = make_set(LoadedDllPath, 10),
-    DriverFiles      = make_set(DriverFile, 10),
-    DriverFolders    = make_set(DriverFolder, 10),
-    ServiceCmds      = make_set(ServiceCmd, 10),
-    Droppers         = make_set(Dropper, 10),
-    LoaderProcs      = make_set(LoaderProc, 10),
-    SideloadEventCnt = dcount(LoadedDll),
-    DriverDropCnt    = dcount(DriverFile)
-  by DeviceId
-
-// 6) Scoring – light, non-redundant, focused on unique value
-| extend
-    BaseScore        = 40,
-    Score_MultiDll   = iif(SideloadEventCnt >= 3, 5, 0),          // repeated odd DLL loads
-    Score_MultiDrv   = iif(DriverDropCnt   >= 2, 5, 0),          // multiple drivers dropped
-    Score_TempPath   = iif(array_length(DriverFolders) > 0
-                            and tostring(DriverFolders) has "\\Temp\\", 5, 0),
-    Score_ProgramData= iif(tostring(DriverFolders) has "\\ProgramData\\", 5, 0),
-    RiskScore        = BaseScore + Score_MultiDll + Score_MultiDrv + Score_TempPath + Score_ProgramData,
-    RiskLevel        = case(
-        RiskScore >= 75, "Critical",
-        RiskScore >= 60, "High",
-        RiskScore >= 50, "Medium",
-        "Low"
-    )
-
-// 7) Core hunter directive – concise but actionable
-| extend HunterDirective = case(
-    RiskLevel == "Critical",
-        strcat(
-            "CRITICAL: Likely SilverFox/ValleyRat-style BYOVD chain. Loader (",
-            LoaderName, ") from ", LoaderPath,
-            " sideloaded DLL(s) from ", tostring(LoadedDllPaths),
-            " and dropped driver(s) ", tostring(DriverFiles),
-            " into ", tostring(DriverFolders),
-            " with kernel service creation in ServiceCmds. Isolate host, acquire full disk + memory,",
-            " and confirm driver signature/timestamp against vendor baselines."
-        ),
-    RiskLevel == "High",
-        strcat(
-            "HIGH: Sideloading + driver service creation sequence detected. Review loader ",
-            LoaderName, " and dropped driver(s) ", tostring(DriverFiles),
-            ". Validate if any driver is a known vulnerable BYOVD component and check for security tool tampering."
-        ),
-    RiskLevel == "Medium",
-        "MEDIUM: Sideloading behaviour chained with driver service creation on user-writable path. Baseline for legitimate software deployment; if none expected, escalate for manual review.",
-    "LOW: SilverFox/ValleyRat core pattern partially present; keep for hunting but not alerting."
+// 5) AGGREGATION & SCORING
+| summarize 
+    FirstSeen      = min(SideloadTime),
+    LastSeen       = max(LoadTime),
+    LoaderName     = any(LoaderName),
+    LoaderPath     = any(LoaderPath),
+    LoadedDlls     = make_set(LoadedDll, 10),
+    DriverFiles    = make_set(DriverFile, 10),
+    ServiceTargets = make_set(ServiceCmd, 10),
+    ServiceMethods = make_set(Method, 10)
+    by DeviceId
+| extend RiskScore = 80 // High confidence due to Signed Loader + Driver Drop + Service Chain
+| extend HunterDirective = strcat(
+    "DETECTED: Signed Loader (", LoaderName, ") running from ", LoaderPath, 
+    " sideloaded DLL, dropped driver(s) ", tostring(DriverFiles), 
+    ", and created kernel service via ", tostring(ServiceMethods), 
+    ". Verify driver signature and isolate host."
 )
-
-// 8) Core hunt output – show Medium+ by default
-| where RiskLevel in ("Medium","High","Critical")
-| project
-    FirstSeen,
-    LastSeen,
-    DeviceId,
-    LoaderName,
-    LoaderPath,
-    LoadedDlls,
-    LoadedDllPaths,
-    DriverFiles,
-    DriverFolders,
-    ServiceCmds,
-    Droppers,
-    LoaderProcs,
-    SideloadEventCnt,
-    DriverDropCnt,
-    RiskScore,
-    RiskLevel,
-    HunterDirective
-| order by RiskScore desc, LastSeen desc
+| order by LastSeen desc
