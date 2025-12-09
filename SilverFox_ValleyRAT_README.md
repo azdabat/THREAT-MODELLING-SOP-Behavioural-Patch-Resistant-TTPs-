@@ -335,8 +335,100 @@ Why separate?
 - Expensive joins.
 - Used by IR, not for real-time alerting.
 
-PART 2
+# 11. Rule Set Overview
 
+This section documents the five rule families that make up the **SilverFox / ValleyRAT Behavioural Detection Framework**.  
+The rules live in the `/rules/` folder as:
 
-## 7.1 Full Kill Chain (ASCII)
+- `rules/SilverFox_ValleyRAT_ScriptStager.kql`
+- `rules/SilverFox_ValleyRAT_Core_Sideload.kql`
+- `rules/SilverFox_ValleyRAT_Injection.kql`
+- `rules/SilverFox_ValleyRAT_BYOVD.kql`
+- `rules/SilverFox_ValleyRAT_Advanced_KillChain.kql`
 
+Each rule is:
+
+- **behaviour-first** (no hash / static IOC dependence)  
+- designed to be **environment-agnostic but tuneable**  
+- aligned to **MITRE** and **IR priorities**  
+- written to **avoid “math as a gate”** – scoring is used to prioritise, not to hide detections  
+
+At a high level:
+
+| Rule | Stage | Purpose |
+|------|--------|---------|
+| ScriptStager | Stage 1 | Detect script-based downloaders/dropper mechanics |
+| Core_Sideload | Stage 3–4 | Detect signed-loader + DLL sideload in user paths |
+| Injection | Stage 4 | Detect process injection into svchost/msbuild/etc. |
+| BYOVD | Stage 6 | Detect driver drops + service creation + timestamp abuse |
+| Advanced_KillChain | Stage 1–7 | Correlate all phases into one narrative for IR |
+
+---
+
+# 12. Rule Definitions & Behaviour (Per File)
+
+Below are **summaries** and **core logic patterns** for each rule.  
+The full queries are stored in `/rules/` and should be treated as L3-ready artefacts.
+
+---
+
+## 12.1 Script Stager Hunt  
+`rules/SilverFox_ValleyRAT_ScriptStager.kql`
+
+**Goal:** Catch Stage-1 downloaders (PowerShell / CMD / Certutil / BITS / WScript) that download payloads into user-writable directories and immediately drop an EXE/DLL.
+
+**Key telemetry:**
+
+- `DeviceProcessEvents` – script engine execution  
+- `DeviceFileEvents` – EXE/DLL drops  
+- 10-minute **tight time window** per host/process  
+
+**Core logic pattern (simplified):**
+
+```kql
+// SILVERFOX / VALLEYRAT – SCRIPT STAGER HUNT (Stage 1)
+let Lookback = 48h;
+let WritablePaths = dynamic(["\\Users\\","\\Downloads\\","\\Desktop\\","\\Temp\\","\\ProgramData\\","\\Public\\"]);
+
+// 1) Script / LOLBin stager
+let ScriptEvents =
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| where FileName in~ ("powershell.exe","cmd.exe","mshta.exe","wscript.exe","cscript.exe","certutil.exe","bitsadmin.exe")
+| where ProcessCommandLine has_any (
+    "iwr","wget","curl","Invoke-WebRequest","DownloadFile","DownloadString",
+    "Net.WebClient","Start-BitsTransfer","bitsadmin",
+    "urlcache","-split","ADODB.Stream","XMLHTTP"
+)
+| project DeviceId, ScriptTime=Timestamp, ScriptPid=ProcessId,
+          ScriptName=FileName, ScriptCmd=ProcessCommandLine,
+          ScriptParent=InitiatingProcessFileName;
+
+// 2) Executable/DLL drops into user-writable folders
+let FileDrops =
+DeviceFileEvents
+| where Timestamp > ago(Lookback)
+| where FileName matches regex @"\.(exe|dll)$"
+| where FolderPath has_any (WritablePaths)
+| project DeviceId, DropTime=Timestamp, DroppedFile=FileName,
+          DropPath=FolderPath, DropperPid=InitiatingProcessId;
+
+// 3) Correlate: same PID, within 10m
+ScriptEvents
+| join kind=inner (FileDrops) on DeviceId
+| where DropperPid == ScriptPid
+| where DropTime between (ScriptTime .. ScriptTime + 10m)
+| summarize FirstSeen=min(ScriptTime),
+            ScriptCmd=any(ScriptCmd),
+            DroppedFiles=make_set(DroppedFile, 10),
+            DropPaths=make_set(DropPath, 10)
+   by DeviceId, ScriptName, ScriptParent
+| extend Severity = "High",
+         HunterDirective = strcat(
+           "HIGH: Script-based stager. ", ScriptName,
+           " (parent: ", ScriptParent,
+           ") executed download command and dropped payload(s) ",
+           tostring(DroppedFiles), " into ", tostring(DropPaths),
+           ". Review ScriptCmd and destination domains; consider blocking if unapproved."
+         )
+| order by FirstSeen desc
