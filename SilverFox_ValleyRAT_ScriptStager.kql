@@ -1,0 +1,100 @@
+//////////////////////////////////////////////////////////////////////////////////////////
+// SilverFox / ValleyRAT – 
+// File: SilverFox_ValleyRAT_ScriptStager.kql
+//
+// Detects:
+//   - LNK/PDF/ISO -> script engine stagers
+//   - PowerShell / cmd / mshta / wscript / certutil / bitsadmin downloads
+//   - EXE/DLL drops to user-writable paths shortly after script execution
+//
+// Key Fixes:
+//   - Time-bounded correlation (DropTime within 10m of ScriptTime)
+//   - PID match (DropperPid == ScriptPid)
+//   - Expanded LOLBins (certutil, bitsadmin)
+//   - Expanded .NET/BITS/VBS download patterns
+//////////////////////////////////////////////////////////////////////////////////////////
+
+let Lookback = 48h;
+let WritablePaths = dynamic([
+    "\\Users\\","\\Downloads\\","\\Desktop\\","\\Temp\\",
+    "\\ProgramData\\","\\Public\\","\\AppData\\"
+]);
+
+// 1) Script / LOLBin execution with download semantics
+let ScriptEvents =
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| where FileName in~ (
+    "powershell.exe","cmd.exe","mshta.exe",
+    "wscript.exe","cscript.exe","certutil.exe","bitsadmin.exe"
+)
+// Download / staging keywords (PowerShell, .NET, BITS, Certutil, VB/JScript)
+| where ProcessCommandLine has_any (
+    // Generic downloaders
+    "iwr","wget","curl","Invoke-WebRequest","Invoke-RestMethod",
+    "DownloadFile","DownloadString",
+    // .NET and BITS
+    "Net.WebClient","Start-BitsTransfer","bitsadmin",
+    // Certutil-style file pulls
+    "urlcache","-split",
+    // Classic VB/JScript loaders
+    "ADODB.Stream","XMLHTTP"
+)
+| project
+    DeviceId,
+    ScriptTime      = Timestamp,
+    ScriptPid       = ProcessId,
+    ScriptName      = FileName,
+    ScriptCmd       = ProcessCommandLine,
+    ScriptParent    = InitiatingProcessFileName,
+    ScriptParentPid = InitiatingProcessId;
+
+// 2) Payload drops (EXE/DLL) into user-writable paths
+let FileDrops =
+DeviceFileEvents
+| where Timestamp > ago(Lookback)
+| where (FileName endswith ".exe" or FileName endswith ".dll")
+| where FolderPath has_any (WritablePaths)
+| project
+    DeviceId,
+    DropTime   = Timestamp,
+    DroppedFile = FileName,
+    DropPath    = FolderPath,
+    DropperPid  = InitiatingProcessId;
+
+// 3) Correlate script → drop by PID and within time window
+ScriptEvents
+| join kind=inner (FileDrops) on DeviceId
+    // Drop must be shortly after script execution
+    | where DropTime between (ScriptTime .. ScriptTime + 10m)
+    // The same process that ran the script is responsible for the drop
+    | where DropperPid == ScriptPid
+| summarize
+    FirstSeen    = min(ScriptTime),
+    LastSeen     = max(DropTime),
+    ScriptName   = any(ScriptName),
+    ScriptParent = any(ScriptParent),
+    ScriptCmd    = any(ScriptCmd),
+    DroppedFiles = make_set(DroppedFile, 10),
+    DropPaths    = make_set(DropPath, 10)
+  by DeviceId
+| extend Severity = "High"
+| extend HunterDirective = strcat(
+    "HIGH: Script-based stager detected. ",
+    ScriptName, " (parent: ", ScriptParent,
+    ") executed download logic and dropped payload(s) ",
+    tostring(DroppedFiles), " to ", tostring(DropPaths),
+    ". Review ScriptCmd for external domains and pivot into follow-on execution."
+)
+| project
+    FirstSeen,
+    LastSeen,
+    Severity,
+    DeviceId,
+    ScriptName,
+    ScriptParent,
+    ScriptCmd,
+    DroppedFiles,
+    DropPaths,
+    HunterDirective
+| order by FirstSeen desc
