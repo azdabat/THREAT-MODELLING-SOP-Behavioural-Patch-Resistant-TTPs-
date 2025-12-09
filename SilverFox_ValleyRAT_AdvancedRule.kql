@@ -1,0 +1,96 @@
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// SilverFox / ValleyRAT – ADVANCED KILL CHAIN 
+// Author: Ala Dabat
+// Purpose: Full chain detection — Sideload → BYOVD → Tamper → Cred Theft → Exfil.
+// Key correction: Severity is NOT used to filter. The sideload anchor ALWAYS surfaces.
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+let Lookback = 48h;
+let WritablePaths = dynamic(["\\Users\\","\\Downloads\\","\\Desktop\\","\\Temp\\","\\Public\\","\\ProgramData\\","\\AppData\\"]);
+
+// 1) Anchor: Sideloading event
+let SL =
+DeviceImageLoadEvents
+| where Timestamp > ago(Lookback)
+| where FileName endswith ".dll"
+| where FolderPath has_any (WritablePaths)
+| where InitiatingProcessSignatureStatus == "Signed"
+| project DeviceId, SL_Time=Timestamp, LoaderPid=InitiatingProcessId,
+    LoaderName=InitiatingProcessFileName, LoaderPath=InitiatingProcessFolderPath,
+    Dll=FileName, DllPath=FolderPath;
+
+// 2) Driver drops
+let Drv =
+DeviceFileEvents
+| where Timestamp > ago(Lookback)
+| where FileName has_any (".sys",".tmp",".dat")
+| where FolderPath has_any (WritablePaths)
+| project DeviceId, DrvTime=Timestamp, DrvFile=FileName, DrvPath=FolderPath;
+
+// 3) Driver load / service creation
+let Svc =
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| where FileName in~ ("sc.exe","pnputil.exe")
+| where ProcessCommandLine has_any (".sys","binPath")
+| project DeviceId, SvcTime=Timestamp, SvcCmd=ProcessCommandLine;
+
+// 4) Tampering
+let Tmp =
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| where ProcessCommandLine has_any ("Stop-Service","WinDefend","Sense","MsMpEng","Add-MpPreference","exclusion")
+| project DeviceId, TmpTime=Timestamp, TmpCmd=ProcessCommandLine;
+
+// 5) Cred theft
+let Cred =
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| where ProcessCommandLine has_any ("lsass","MiniDump","comsvcs.dll")
+| project DeviceId, CredTime=Timestamp, CredCmd=ProcessCommandLine;
+
+// 6) Exfiltration
+let XF =
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| where (FileName has_any ("curl","wget","bitsadmin") and ProcessCommandLine has "http")
+   or (FileName in~ ("7z.exe","rar.exe") and ProcessCommandLine has " a ")
+| project DeviceId, XF_Time=Timestamp, XF_Cmd=ProcessCommandLine;
+
+// TIME-BOUND JOINS
+SL
+| join kind=leftouter (Drv) on DeviceId | where isnull(DrvTime) or DrvTime between (SL_Time .. SL_Time + 4h)
+| join kind=leftouter (Svc) on DeviceId | where isnull(SvcTime) or SvcTime between (SL_Time .. SL_Time + 6h)
+| join kind=leftouter (Tmp) on DeviceId | where isnull(TmpTime) or TmpTime between (SL_Time .. SL_Time + 8h)
+| join kind=leftouter (Cred) on DeviceId | where isnull(CredTime) or CredTime between (SL_Time .. SL_Time + 8h)
+| join kind=leftouter (XF) on DeviceId | where isnull(XF_Time) or XF_Time between (SL_Time .. SL_Time + 8h)
+
+// AGGREGATE
+| summarize
+    FirstSeen = min(SL_Time),
+    LastSeen  = max(coalesce(SvcTime, DrvTime, TmpTime, CredTime, XF_Time, SL_Time)),
+    LoaderName = any(LoaderName),
+    Dlls = make_set(Dll, 10),
+    HasDriver = max(iif(isnotempty(DrvFile),1,0)),
+    HasSvc = max(iif(isnotempty(SvcCmd),1,0)),
+    HasTamper = max(iif(isnotempty(TmpCmd),1,0)),
+    HasCred = max(iif(isnotempty(CredCmd),1,0)),
+    HasExfil = max(iif(isnotempty(XF_Cmd),1,0))
+  by DeviceId
+
+// SEVERITY LOGIC
+| extend Severity = case(
+    HasExfil == 1 or HasCred == 1 or HasTamper == 1, "Critical",
+    HasDriver == 1 or HasSvc == 1,                   "High",
+    "Medium"
+)
+
+| extend HunterDirective = case(
+    Severity == "Critical", 
+        "CRITICAL: Sideloading with tampering, exfiltration, or credential theft.",
+    Severity == "High",
+        "HIGH: Sideload → Driver or Service creation. Possible rootkit install.",
+    "MEDIUM: Suspicious DLL sideloading. Validate executable legitimacy."
+)
+
+| order by Severity desc, LastSeen desc
