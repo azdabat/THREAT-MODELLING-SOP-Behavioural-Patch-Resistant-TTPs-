@@ -1,0 +1,30 @@
+//////////////////////////////////////////////////////////////////////////////////////////
+// SilverFox / ValleyRAT – Script Stager Detection
+// File: SilverFox_ValleyRAT_ScriptStager.kql
+//
+// Detects early-stage script execution chain used by:
+//   - PDF/LNK stagers
+//   - PowerShell download cradles
+//   - Dropper → sideload transitions
+//////////////////////////////////////////////////////////////////////////////////////////
+
+let Lookback = 48h;
+let WritablePaths = dynamic(["\\Users\\","\\Downloads\\","\\Desktop\\","\\Temp\\","\\Public\\"]);
+
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| where FileName in~ ("powershell.exe","cmd.exe","mshta.exe","wscript.exe")
+| where ProcessCommandLine has_any ("iwr","wget","curl","Invoke-WebRequest","DownloadFile","bitsadmin")
+| join kind=leftouter (
+      DeviceFileEvents
+      | where FileName endswith ".exe"
+      | where FolderPath has_any (WritablePaths)
+      | project DeviceId, DropTime=Timestamp, DroppedExe=FileName, DropPath=FolderPath
+  ) on DeviceId
+| extend Severity="Medium",
+         HunterDirective=strcat("MEDIUM: Script-based stager detected. ",
+                                "Downloader executed from ",InitiatingProcessFolderPath,
+                                " dropping ",DroppedExe," to ",DropPath)
+| project Timestamp, DeviceId, FileName, ProcessCommandLine,
+          DroppedExe, DropPath, Severity, HunterDirective
+| order by Timestamp desc
