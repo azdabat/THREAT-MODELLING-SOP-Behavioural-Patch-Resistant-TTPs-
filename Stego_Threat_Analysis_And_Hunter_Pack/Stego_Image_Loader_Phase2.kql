@@ -1,0 +1,86 @@
+// ============================================================================
+// Stego Image Loader — Phase 2 (Quiet Post-Decrypt Execution)
+// Author: Ala Dabat (L3 Enhanced)
+// Purpose:
+//   Catch post-decrypt execution EVEN WHEN:
+//   - No PowerShell strings
+//   - Native loaders used
+//   - Execution occurs in child process
+//
+// MITRE:
+//   TA0002 Execution
+//   TA0005 Defense Evasion
+//   T1027.003 Steganography
+//   T1620 Reflective Code Loading
+// ============================================================================
+
+let lookback = 7d;
+let TimeWindow = 10m;
+
+// Phase 1 anchors (reuse your existing stego Phase 1 output)
+let StegoAnchors =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName in~ ("powershell.exe","mshta.exe","wscript.exe","rundll32.exe")
+| project
+    DeviceId,
+    AnchorPid = ProcessId,
+    AnchorTime = Timestamp,
+    AnchorProc = FileName;
+
+// Expand PID scope: root + immediate children
+let PidScope =
+StegoAnchors
+| join kind=leftouter (
+    DeviceProcessEvents
+    | where Timestamp >= ago(lookback)
+    | project
+        DeviceId,
+        ParentPid = InitiatingProcessId,
+        ChildPid = ProcessId,
+        ChildTime = Timestamp,
+        ChildProc = FileName
+) on DeviceId, $left.AnchorPid == $right.ParentPid
+| where ChildTime between (AnchorTime .. AnchorTime + TimeWindow)
+| extend ScopedPid = coalesce(ChildPid, AnchorPid)
+| project DeviceId, AnchorTime, ScopedPid, AnchorProc;
+
+// Quiet execution indicators (NO STRINGS REQUIRED)
+let QuietExecSignals =
+union
+(
+    // Network without file drop (classic in-memory)
+    DeviceNetworkEvents
+    | where Timestamp >= ago(lookback)
+    | project DeviceId, ExecTime=Timestamp, ExecType="Network", ProcId=InitiatingProcessId
+),
+(
+    // Injection / memory APIs
+    DeviceProcessEvents
+    | where Timestamp >= ago(lookback)
+    | where ProcessCommandLine has_any ("VirtualAlloc","WriteProcessMemory","CreateRemoteThread")
+    | project DeviceId, ExecTime=Timestamp, ExecType="Memory", ProcId=ProcessId
+);
+
+// Correlate quiet execution after stego image read
+PidScope
+| join kind=inner (QuietExecSignals) on DeviceId, $left.ScopedPid == $right.ProcId
+| where ExecTime between (AnchorTime .. AnchorTime + TimeWindow)
+| summarize
+    FirstSeen = min(AnchorTime),
+    LastSeen  = max(ExecTime),
+    ExecTypes = make_set(ExecType),
+    ScopedPids = make_set(ScopedPid)
+  by DeviceId
+| extend Severity = "Critical"
+| extend HunterDirective =
+    "CRITICAL: Stego loader followed by quiet post-decrypt execution (memory/network activity without file drops or AMSI visibility). Strong indicator of in-memory payload execution."
+| project
+    FirstSeen,
+    LastSeen,
+    DeviceId,
+    ExecTypes,
+    ScopedPids,
+    Severity,
+    HunterDirective
+| order by LastSeen desc
