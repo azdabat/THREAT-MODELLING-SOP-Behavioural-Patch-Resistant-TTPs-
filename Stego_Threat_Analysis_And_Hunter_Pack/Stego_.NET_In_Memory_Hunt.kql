@@ -1,0 +1,123 @@
+// ============================================================================
+// Stego Image Loader — Phase 2 (Reflective .NET / Memory Indicators)
+// Author: Ala Dabat
+// Version: 2025-12 (Advanced Hunt Phase 2)
+// Purpose: Extend image-based loader hunt to catch reflective .NET loaders and
+//          in-memory execution patterns following stego image usage.
+// MITRE: TA0002 (Execution), TA0005 (Defense Evasion), TA0011 (C2)
+//        T1059.001, T1059.003, T1059.005, T1027.003, T1620
+// ============================================================================
+
+let lookback = 7d;
+let UserFacingParents = dynamic([
+    "outlook.exe","winword.exe","excel.exe","powerpnt.exe",
+    "chrome.exe","msedge.exe","iexplore.exe"
+]);
+
+let ScriptAndLolbins = dynamic([
+    "powershell.exe","pwsh.exe","cmd.exe",
+    "wscript.exe","cscript.exe",
+    "mshta.exe","rundll32.exe"
+]);
+
+// --------------------------------------------------
+// Phase 1 Anchor: image loader behaviour
+// (simplified version of the core stego hunt)
+// --------------------------------------------------
+let StegoPhase1 =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where InitiatingProcessParentFileName in~ (UserFacingParents)
+| where FileName in~ (ScriptAndLolbins)
+| project
+    DeviceId,
+    DeviceName,
+    AccountName = tostring(InitiatingProcessAccountName),
+    LoaderProc = FileName,
+    LoaderParent = InitiatingProcessParentFileName,
+    LoaderPid  = ProcessId,
+    LoaderTime = Timestamp
+| join kind=inner (
+    DeviceFileEvents
+    | where Timestamp >= ago(lookback)
+    | where ActionType == "FileRead"
+    | where FileName endswith ".png" or FileName endswith ".jpg" or FileName endswith ".jpeg"
+    | where FolderPath has_any ("\\Temp\\","\\Downloads\\","\\AppData\\Local\\Temp\\")
+    | project DeviceId, InitiatingProcessId, ImageReadTime = Timestamp, ImageFile = FileName, ImagePath = FolderPath
+) on DeviceId, $left.LoaderPid == $right.InitiatingProcessId
+| extend Phase1Time = iff(LoaderTime < ImageReadTime, LoaderTime, ImageReadTime)
+;
+
+// --------------------------------------------------
+// Phase 2: reflective .NET / memory indicator layer
+// --------------------------------------------------
+let DotNetMemIndicators = dynamic([
+    "System.Reflection.Assembly::Load",
+    "System.Reflection.Assembly.Load",
+    "FromBase64String(",
+    "VirtualAlloc",
+    "VirtualProtect",
+    "WriteProcessMemory",
+    "CreateRemoteThread",
+    "Add-Type -TypeDefinition",
+    "[Convert]::FromBase64String",
+    "IEX (New-Object Net.WebClient).DownloadString",
+    "Reflection.Emit"
+]);
+
+StegoPhase1
+| join kind=inner (
+    DeviceProcessEvents
+    | where Timestamp >= ago(lookback)
+    | extend Cmd = tostring(ProcessCommandLine)
+    | where Cmd has_any (DotNetMemIndicators)
+    | project
+        DeviceId,
+        ProcessId,
+        Timestamp,
+        FileName,
+        ProcessCommandLine = Cmd
+) on DeviceId, $left.LoaderPid == $right.ProcessId
+| where Timestamp between (Phase1Time .. Phase1Time + 10m)
+| extend
+    SuspiciousProc = FileName,
+    SuspiciousTime = Timestamp
+// ----------------------------------------
+// Basic scoring & hunter directive
+// ----------------------------------------
+| extend BaseScore = 5
+| extend Score =
+    BaseScore
+    + iif(LoaderParent in~ ("outlook.exe","winword.exe","excel.exe"), 2, 0)
+    + iif(ProcessCommandLine has "FromBase64String", 1, 0)
+    + iif(ProcessCommandLine has_any ("VirtualAlloc","WriteProcessMemory","CreateRemoteThread"), 2, 0)
+| extend RiskLevel = case(
+    Score >= 9, "Critical",
+    Score >= 7, "High",
+    Score >= 5, "Medium",
+    "Low"
+)
+| extend HunterDirective = case(
+    RiskLevel == "Critical",
+        "CRITICAL: Office/browser-spawned script or LOLBin read an image from temp/downloads and then executed reflective .NET / memory API patterns. Isolate host, capture memory, and treat as active stego-based loader intrusion.",
+    RiskLevel == "High",
+        "HIGH: Strong indicators of in-memory .NET loader execution following image read activity. Validate user action (email / web) and pull full process tree plus network connections.",
+    RiskLevel == "Medium",
+        "MEDIUM: Suspicious .NET/memory patterns following script execution. Compare with known admin/int tooling before escalation.",
+    "LOW"
+        "LOW: Interesting but weak signal; use for hypothesis-driven hunting."
+)
+| project
+    SuspiciousTime,
+    DeviceName,
+    AccountName,
+    LoaderParent,
+    LoaderProc,
+    ImageFile,
+    ImagePath,
+    SuspiciousProc,
+    ProcessCommandLine,
+    Score,
+    RiskLevel,
+    HunterDirective
+| order by Score desc, SuspiciousTime desc
