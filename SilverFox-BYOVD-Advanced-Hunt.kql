@@ -87,9 +87,7 @@ DeviceProcessEvents
    or (ProcessCommandLine has_any ("curl", "wget", "bitsadmin") and ProcessCommandLine has "http") // Exfil
 | project DeviceId, ExfilTime=Timestamp, ExfilCmd=ProcessCommandLine, ExfilPid=InitiatingProcessId;
 
-// ============================================================================================
 // 3. CORRELATION & AGGREGATION
-// ============================================================================================
 
 SideloadEvents
 // Join enrichment data. We use LeftOuter because we want to see the Sideload even if the rest hasn't happened yet.
@@ -124,9 +122,7 @@ SideloadEvents
     HasExfil        = max(iif(isnotempty(ExfilCmd), 1, 0))
     by DeviceId
 
-// ============================================================================================
 // 4. SEVERITY & DIRECTIVE LOGIC
-// ============================================================================================
 
 | extend Severity = case(
     // CRITICAL: Sideload + (Tampering OR Exfil OR Creds) -> Active Hands-on-Keyboard
