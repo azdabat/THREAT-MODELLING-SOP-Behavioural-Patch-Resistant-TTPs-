@@ -32,9 +32,7 @@
 let Lookback = 48h;
 let WritablePaths = dynamic(["\\Temp\\","\\ProgramData\\","\\Users\\","\\Public\\","\\Desktop\\","\\Downloads\\"]);
 
-// ============================================================================================
-// 1. CORE SPINE: Sideloading (The Anchor Event)
-// ============================================================================================
+// 1. CORE SPINE: Sideloading
 let SideloadEvents =
 DeviceImageLoadEvents
 | where Timestamp > ago(Lookback)
