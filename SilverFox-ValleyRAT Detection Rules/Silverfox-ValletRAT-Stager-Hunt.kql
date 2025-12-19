@@ -1,0 +1,125 @@
+//////////////////////////////////////////////////////////////////////////////////////////
+// SilverFox / ValleyRAT – Script Stager Hunt (Improved / Final Detection)
+// File: SilverFox_ValleyRAT_ScriptStager.kql
+// Author: Ala Dabat
+// Version: 2025-12 (Rev2)
+// STILL WORK IN PROGRESS
+// PURPOSE
+// Detect early-stage script/LOLBIN stagers that:
+//  - execute download semantics (PowerShell/certutil/bitsadmin/mshta/wscript/cmd/etc.)
+//  - and shortly after result in payload drops into user-writable locations
+//
+// KEY CORRECTIONS (behavioural, not IOC-driven)
+// 1) Removes the overly-restrictive “DropperPid == ScriptPid” gating
+//    by allowing “ScriptPid OR ScriptChildPid” (common in real chains)
+// 2) Expands dropped artifact types beyond EXE/DLL to match SilverFox staging reality
+//    (.sys/.dat/.bin/.tmp/.vbe/.js/.ps1/.bat/.cmd/.scr/.cab/.msi/.iso/.lnk)
+// 3) Keeps time-bounded correlation, but makes it configurable and less brittle
+//
+// TABLES
+// DeviceProcessEvents, DeviceFileEvents
+//
+// MITRE
+// T1204.002 User Execution | T1059 Command and Scripting Interpreter | T1105 Ingress Tool Transfer
+//////////////////////////////////////////////////////////////////////////////////////////
+
+let Lookback   = 48h;
+let CorrWindow = 30m;   // was 10m; SilverFox chains frequently exceed 10m (installer → orchestrator → drop)
+let ChildWindow = 10m;  // window to capture script-spawned child processes
+
+let WritablePaths = dynamic([
+    "\\Users\\","\\Downloads\\","\\Desktop\\","\\Temp\\",
+    "\\ProgramData\\","\\Public\\","\\AppData\\"
+]);
+
+// Broadened drop types (behavioural staging). Avoids “just EXE/DLL” blind spot.
+let StagedArtifactExtRegex = @"\.(exe|dll|sys|dat|bin|tmp|scr|cab|msi|iso|img|vbs|vbe|js|jse|wsf|ps1|bat|cmd|lnk)$";
+
+// Stage-1 download semantics (PS/.NET/BITS/Certutil/VB/JScript)
+let DownloadTokens = dynamic([
+    "iwr","wget","curl","Invoke-WebRequest","Invoke-RestMethod",
+    "DownloadFile","DownloadString",
+    "Net.WebClient","Start-BitsTransfer","bitsadmin",
+    "urlcache","-split",
+    "ADODB.Stream","XMLHTTP"
+]);
+
+// 1) Script / LOLBin execution with download semantics
+let ScriptEvents =
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| where FileName in~ ("powershell.exe","pwsh.exe","cmd.exe","mshta.exe","wscript.exe","cscript.exe","certutil.exe","bitsadmin.exe")
+| where isnotempty(ProcessCommandLine)
+| where ProcessCommandLine has_any (DownloadTokens)
+| project
+    DeviceId,
+    ScriptTime      = Timestamp,
+    ScriptPid       = ProcessId,
+    ScriptName      = FileName,
+    ScriptCmd       = ProcessCommandLine,
+    ScriptParent    = InitiatingProcessFileName,
+    ScriptParentPid = InitiatingProcessId,
+    ScriptAccount   = coalesce(AccountUpn, InitiatingProcessAccountUpn, AccountName, InitiatingProcessAccountName);
+
+// 2) Child processes spawned by the script within a short window (common: installer/orchestrator spawns dropper)
+let ScriptChildren =
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| project DeviceId, ChildTime=Timestamp, ChildPid=ProcessId, ChildName=FileName, ChildCmd=ProcessCommandLine, ParentPid=InitiatingProcessId
+| join kind=inner (ScriptEvents) on DeviceId
+| where ParentPid == ScriptPid
+| where ChildTime between (ScriptTime .. ScriptTime + ChildWindow)
+| project DeviceId, ScriptTime, ScriptPid, ScriptName, ScriptCmd, ScriptParent, ScriptParentPid, ScriptAccount,
+          ChildPid, ChildName, ChildCmd, ChildTime;
+
+// 3) Payload drops (broad staging artifacts) into user-writable paths
+let FileDrops =
+DeviceFileEvents
+| where Timestamp > ago(Lookback)
+| where ActionType in ("FileCreated","FileModified","FileRenamed","FileMoved")
+| where FolderPath has_any (WritablePaths)
+| where FileName matches regex StagedArtifactExtRegex
+| project
+    DeviceId,
+    DropTime   = Timestamp,
+    DroppedFile = FileName,
+    DropPath    = FolderPath,
+    DropperPid  = InitiatingProcessId,
+    DropperProc = InitiatingProcessFileName,
+    DropperCmd  = InitiatingProcessCommandLine,
+    DropperAccount = coalesce(InitiatingProcessAccountUpn, InitiatingProcessAccountName);
+
+// 4) Correlate script → drop:
+//    - dropper is either the script itself OR a direct child spawned by the script
+//    - within CorrWindow
+ScriptEvents
+| join kind=inner (FileDrops) on DeviceId
+| where DropTime between (ScriptTime .. ScriptTime + CorrWindow)
+| extend DropperMatch = iif(DropperPid == ScriptPid, "ScriptPid", "OtherPid")
+| join kind=leftouter (ScriptChildren) on DeviceId, ScriptPid
+| extend IsChildDropper = iif(DropperPid == ChildPid, 1, 0)
+| where (DropperPid == ScriptPid) or (IsChildDropper == 1)
+// Mild behavioural sanity: same user context if available (do not hard-gate if missing)
+| where isempty(ScriptAccount) or isempty(DropperAccount) or ScriptAccount == DropperAccount
+| summarize
+    FirstSeen    = min(ScriptTime),
+    LastSeen     = max(DropTime),
+    ScriptName   = any(ScriptName),
+    ScriptParent = any(ScriptParent),
+    ScriptCmd    = any(ScriptCmd),
+    ChildProcs   = make_set(ChildName, 10),
+    DropperProcs = make_set(DropperProc, 10),
+    DroppedFiles = make_set(DroppedFile, 15),
+    DropPaths    = make_set(DropPath, 10),
+    SampleDropperCmd = any(DropperCmd)
+  by DeviceId
+| extend Severity = "HIGH"
+| extend HunterDirective = strcat(
+    "HIGH: Script-based stager with download semantics and rapid payload staging. ",
+    "Script=", ScriptName, " (parent=", ScriptParent, "). ",
+    "Dropped=", tostring(DroppedFiles), " into ", tostring(DropPaths), ". ",
+    "DropperProcs=", tostring(DropperProcs), "; ChildProcs=", tostring(ChildProcs), ". ",
+    "Next: pivot to DeviceProcessEvents for execution of dropped artifacts; pivot to DeviceNetworkEvents for outbound domains/IPs seen around FirstSeen."
+)
+| project FirstSeen, LastSeen, Severity, DeviceId, ScriptName, ScriptParent, ScriptCmd, ChildProcs, DropperProcs, DroppedFiles, DropPaths, SampleDropperCmd, HunterDirective
+| order by FirstSeen desc;
