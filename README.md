@@ -6,6 +6,17 @@
 This repository documents a complete, analyst-facing **Threat Modelling Standard Operating Procedure (SOP)** for modern, patch-resistant, behaviour-driven attacks observed across 2024–2025.  
 The objective is to provide a mature, repeatable methodology for modelling threats, understanding their operational tradecraft, and producing **core behavioural hunts** that map directly to real adversary workflows, not isolated events.
 
+> [!NOTE]
+> **Research & Proof-of-Concept (POC) Only**
+>
+> This repository serves as a **Threat Modelling Laboratory**. The logic stored here represents experimental SOPs and behavioral research (POCs). It is **not** designed for direct production deployment.
+>
+> **Migration Path:**
+> Once a detection logic is validated, refined, and normalized for operational use, it is promoted to the **Composite Rules** repository.
+>
+>  **For finished, production-ready rules, please visit:**
+> [**Composite Threat Hunting Rules**](https://github.com/azdabat/Composite-Threat-Hunting-Rules)
+
 Most enterprise detection strategies revolve around signatures, IOCs, and individual CVEs. Those no longer provide meaningful defence against long-term, iterative adversaries such as ransomware crews, identity-centric attackers, and modern loader ecosystems.  
 This SOP shifts the focus to **behavioural kill-chain modelling** and **sequence-based analytics**, enabling organisations to detect the attacker’s method rather than their toolset.
 
