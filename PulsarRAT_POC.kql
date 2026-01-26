@@ -1,0 +1,342 @@
+// ============================================================================
+// L3_TrustedParent_OR_ScheduledTask_LOLBin_InMemoryInjection_Chain_V2
+// Author: Ala Dabat
+//
+// PURPOSE (Composite, behaviour-first):
+//   Catch modern “delivery → persistence → execution → injection → beacon” chains where either:
+//     A) Trusted user-facing parent spawns a LOLBin/loader, OR
+//     B) A Scheduled Task executes a LOLBin/loader (including COM/API-created tasks, no schtasks.exe required)
+//   and that LOLBin/loader then performs injection/tampering into high-value processes,
+//   optionally reinforced by “ghost module load” + first outbound beacon.
+//
+// DATA:
+//   DeviceProcessEvents, DeviceNetworkEvents, DeviceImageLoadEvents (optional), DeviceEvents (optional for tasks)
+//
+// MITRE:
+//   T1055 Process Injection | T1218 Signed Binary Proxy Execution | T1053.005 Scheduled Task
+//   T1620 Reflective Loading | T1105 Ingress Tool Transfer | T1071 C2
+//
+// DESIGN:
+//   Minimum Truth: LOLBin/loader execution + injection/tampering signal (or strong proxy if telemetry missing).
+//   Reinforcement: Trusted parent OR ScheduledTask execution context + rarity + ghost module + beacon.
+//   Noise suppression: safe paths/vendors, allowlisted parents/accounts, installer/updater suppression.
+// ============================================================================
+
+let lookback     = 7d;
+let ChainWindow  = 2m;   // injection soon after loader execution
+let BeaconWindow = 5m;   // first comms slightly wider
+let TaskWindow   = 10m;  // task created/updated recently before first run (when task telemetry exists)
+
+// --- Ports are weak context only; do NOT overfit ---
+let SuspiciousPorts = dynamic([4444,1337,8443,8081,9001]);
+
+// ----------------------------
+// MODE (Hunt default)
+// ----------------------------
+let EnableAllowlist = false;
+
+// --- Core LOLBins (execution / loader glue) ---
+let ExecutionLOLBins = dynamic([
+  "powershell.exe","pwsh.exe","rundll32.exe","regsvr32.exe","mshta.exe",
+  "wscript.exe","cscript.exe","cmd.exe","msiexec.exe","schtasks.exe"
+]);
+
+// --- Trusted / user-facing parents abused for “inheritance camouflage” ---
+let TrustedParents = dynamic([
+  "explorer.exe","chrome.exe","msedge.exe","firefox.exe",
+  "winword.exe","excel.exe","outlook.exe","powerpnt.exe",
+  "teams.exe","onedrive.exe","slack.exe","acrord32.exe"
+]);
+
+// --- High-value injection targets ---
+let HighValueTargets = dynamic([
+  "lsass.exe","winlogon.exe","csrss.exe","services.exe","svchost.exe","explorer.exe",
+  "spoolsv.exe","smss.exe","taskhostw.exe","runtimebroker.exe","sihost.exe","conhost.exe",
+  "dllhost.exe","wmiprvse.exe","werfault.exe","msmpeng.exe","mssense.exe"
+]);
+
+// --- Writable / attacker-favored paths (context only) ---
+let WritableUserPaths = dynamic([
+  @"\users\", @"\appdata\", @"\programdata\", @"\windows\temp\", @"\temp\", @"\windows\tasks\"
+]);
+
+// --- Indicators in cmdline (context) ---
+let InjectionishTokens = dynamic([
+  "virtualalloc","virtualallocex","writeprocessmemory","createremotethread","queueuserapc",
+  "ntallocatevirtualmemory","ntprotectvirtualmemory","ntmapviewofsection","frombase64string",
+  "-enc","-encodedcommand","iex(","invoke-expression"
+]);
+
+let NetworkishTokens = dynamic(["http://","https://","/download","downloadstring","invoke-webrequest","invoke-restmethod","start-bitstransfer"]);
+
+let AllowedParentCmdlinePatterns = dynamic([
+  "officeclicktorun","microsoft office",
+  "chrome.exe --type=utility","msedge.exe --type=utility"
+]);
+let AllowedAccounts = dynamic(["svc-build","svc-it","buildagent","runner"]);
+
+let IsAllowlistedSpawn = (EnableAllowlist and (
+  InitiatingProcessCommandLine has_any (AllowedParentCmdlinePatterns)
+  or InitiatingProcessAccountName has_any (AllowedAccounts)
+));
+
+// --- Noise anchors (light touch) ---
+let SafePathAnchors = dynamic([@"\windows\system32\", @"\windows\syswow64\", @"\program files\", @"\program files (x86)\"]);
+let InstallerParents = dynamic(["msiexec.exe","trustedinstaller.exe","sihost.exe","services.exe"]);
+
+// ============================================================================
+// CAPABILITY PROBES (tenant-aware feature inference)
+// ============================================================================
+
+let HasInjectionTelemetry =
+toscalar(
+  DeviceProcessEvents
+  | where Timestamp >= ago(lookback)
+  | where ActionType in ("CreateRemoteThread","WriteProcessMemory","QueueUserAPC","ProcessTampering","ProcessInjection","ProcessHollowing")
+  | summarize c = count()
+  | project c > 0
+);
+
+let HasImageLoadTelemetry =
+toscalar(
+  DeviceImageLoadEvents
+  | where Timestamp >= ago(lookback)
+  | summarize c = count()
+  | project c > 0
+);
+
+let HasTaskTelemetry =
+toscalar(
+  DeviceEvents
+  | where Timestamp >= ago(lookback)
+  | where ActionType has_any ("ScheduledTask", "Task")
+  | summarize c = count()
+  | project c > 0
+);
+
+let HasNetworkTelemetry =
+toscalar(
+  DeviceNetworkEvents
+  | where Timestamp >= ago(lookback)
+  | summarize c = count()
+  | project c > 0
+);
+
+// ============================================================================
+// ORG PREVALENCE (writer/process rarity reinforcement)
+// NOTE: this is "nice to know", not a dependency
+// ============================================================================
+
+let ProcPrevalence =
+  DeviceProcessEvents
+  | where Timestamp >= ago(30d)
+  | summarize ProcDeviceCount = dcount(DeviceId) by SHA256=tostring(SHA256);
+
+// ============================================================================
+// PHASE 1A — Branch A: Trusted Parent -> LOLBin/loader
+// ============================================================================
+
+let Branch_TrustedParent =
+  DeviceProcessEvents
+  | where Timestamp >= ago(lookback)
+  | where FileName in~ (ExecutionLOLBins)
+  | where InitiatingProcessFileName in~ (TrustedParents)
+  | where not(IsAllowlistedSpawn)
+  | extend Branch = "TrustedParent"
+  | project
+      LoaderTime = Timestamp,
+      DeviceId, DeviceName,
+      LoaderProcessId = ProcessId,
+      LoaderFile = FileName,
+      LoaderPath = FolderPath,
+      LoaderCmd = CommandLine,
+      LoaderSHA256 = tostring(SHA256),
+      ParentFile = InitiatingProcessFileName,
+      ParentCmd  = InitiatingProcessCommandLine,
+      AccountName = coalesce(InitiatingProcessAccountName, AccountName);
+
+// ============================================================================
+// PHASE 1B — Branch B: Scheduled Task execution (COM/API created tasks included)
+// Strategy:
+//   If DeviceEvents task telemetry exists, use it.
+//   Else: approximate "task-executed loader" by spotting rundll32/powershell from taskeng/taskhostw/svchost patterns.
+// ============================================================================
+
+let Branch_TaskExecuted =
+  (
+    // Preferred: explicit task telemetry
+    (DeviceEvents
+      | where HasTaskTelemetry
+      | where Timestamp >= ago(lookback)
+      | where ActionType has_any ("ScheduledTaskCreated","ScheduledTaskUpdated","ScheduledTaskRegistered","ScheduledTaskStarted","ScheduledTaskLaunched","ScheduledTaskExecuted","TaskCreated","TaskUpdated","TaskStarted","TaskRegistered")
+      | extend TaskTime = Timestamp
+      | project DeviceId, TaskTime, ActionType, AdditionalFields
+    )
+    // Fallback: inference based on parentage typical of task execution
+    | union (
+      DeviceProcessEvents
+      | where not(HasTaskTelemetry)
+      | where Timestamp >= ago(lookback)
+      | where FileName in~ (ExecutionLOLBins)
+      | where InitiatingProcessFileName in~ ("taskeng.exe","taskhostw.exe","svchost.exe")
+      | project DeviceId, TaskTime=Timestamp, ActionType="TaskExec_Inferred", AdditionalFields=pack("Parent",InitiatingProcessFileName,"Cmd",InitiatingProcessCommandLine)
+    )
+  )
+  // Join to the loader process near the task time
+  | join kind=inner (
+      DeviceProcessEvents
+      | where Timestamp >= ago(lookback)
+      | where FileName in~ (ExecutionLOLBins)
+      | project
+          DeviceId,
+          LoaderTime = Timestamp,
+          LoaderProcessId = ProcessId,
+          LoaderFile = FileName,
+          LoaderPath = FolderPath,
+          LoaderCmd = CommandLine,
+          LoaderSHA256 = tostring(SHA256),
+          ParentFile = InitiatingProcessFileName,
+          ParentCmd  = InitiatingProcessCommandLine,
+          AccountName
+    ) on DeviceId
+  | where LoaderTime between (TaskTime .. TaskTime + 2m)
+  | extend Branch = "ScheduledTask"
+  | project-away TaskTime1, ActionType1, AdditionalFields1;
+
+// ============================================================================
+// BASE — Candidate loaders from either branch
+// ============================================================================
+
+let CandidateLoaders =
+  Branch_TrustedParent
+  | union Branch_TaskExecuted
+  | extend
+      LoaderCmdL = tolower(coalesce(LoaderCmd,"")),
+      LoaderPathL = tolower(coalesce(LoaderPath,"")),
+      ParentFileL = tolower(coalesce(ParentFile,"")),
+      ParentCmdL  = tolower(coalesce(ParentCmd,"")),
+      PointsWritablePath = toint(LoaderPathL has_any (WritableUserPaths)),
+      HasInjectionHints  = toint(LoaderCmdL has_any (InjectionishTokens)),
+      HasNetworkHints    = toint(LoaderCmdL has_any (NetworkishTokens)),
+      ParentLooksInstaller = toint(ParentFileL in~ (InstallerParents));
+
+// Light noise suppression: if loader is in super safe path and parent is installer-ish, require hints
+CandidateLoaders
+| where not(LoaderPathL has_any (SafePathAnchors) and ParentLooksInstaller == 1 and HasInjectionHints == 0 and HasNetworkHints == 0)
+
+// ============================================================================
+// PHASE 2 — Injection/Tampering correlation (or proxy if telemetry absent)
+// ============================================================================
+
+| join kind=inner (
+    DeviceProcessEvents
+    | where Timestamp >= ago(lookback)
+    | extend TargetProcL = tolower(coalesce(TargetProcessName,""))
+    | where
+        (HasInjectionTelemetry and ActionType in ("CreateRemoteThread","WriteProcessMemory","QueueUserAPC","ProcessTampering","ProcessInjection","ProcessHollowing"))
+        or
+        // If injection ActionTypes aren't present in this tenant, use a strict proxy:
+        (not(HasInjectionTelemetry) and (CommandLine has_any (InjectionishTokens)) )
+    | project
+        DeviceId,
+        InjectTime = Timestamp,
+        InjectorProcessId = ProcessId,
+        InjectorFile = FileName,
+        InjectorCmd  = CommandLine,
+        TargetProcess = TargetProcessName,
+        TargetHighValue = toint(TargetProcL in~ (HighValueTargets))
+) on DeviceId
+
+| where InjectTime between (LoaderTime .. LoaderTime + ChainWindow)
+| where tolower(InjectorFile) == tolower(LoaderFile) or InjectorProcessId == LoaderProcessId
+
+// ============================================================================
+// PHASE 3 — Optional: Ghost module load reinforcement
+// ============================================================================
+
+| join kind=leftouter (
+    DeviceImageLoadEvents
+    | where HasImageLoadTelemetry
+    | where Timestamp >= ago(lookback)
+    | extend ImgPathL = tolower(coalesce(FolderPath,""))
+    | extend GhostModule = toint(ImgPathL has_any (WritableUserPaths) or ImgPathL endswith ".tmp" or ImgPathL endswith ".dat")
+    | project DeviceId, LoaderProcessId=InitiatingProcessId, ImgTime=Timestamp, ImageLoaded=FileName, ImagePath=FolderPath, GhostModule
+) on DeviceId, LoaderProcessId
+
+// ============================================================================
+// PHASE 4 — Optional: First beacon reinforcement
+// ============================================================================
+
+| join kind=leftouter (
+    DeviceNetworkEvents
+    | where HasNetworkTelemetry
+    | where Timestamp >= ago(lookback)
+    | project DeviceId, LoaderProcessId=InitiatingProcessId, NetTime=Timestamp, RemoteIP, RemoteUrl, RemotePort, Protocol
+) on DeviceId, LoaderProcessId
+
+| extend
+    HasBeacon = toint(NetTime between (LoaderTime .. LoaderTime + BeaconWindow)),
+    SuspPort  = toint(tolong(RemotePort) in (SuspiciousPorts)),
+    HasRemoteUrl = toint(isnotempty(RemoteUrl))
+
+// ============================================================================
+// Reinforcement — Org prevalence (rarity)
+// ============================================================================
+
+| join kind=leftouter ProcPrevalence on $left.LoaderSHA256 == $right.SHA256
+| extend ProcDeviceCount = coalesce(ProcDeviceCount, 0), ProcIsRare = toint(ProcDeviceCount <= 2)
+
+// ============================================================================
+// Scoring (framework-aligned)
+// ============================================================================
+
+| extend
+    BaseScore = 55, // Minimum truth: loader + injection (or strict proxy)
+    Score_TaskBranch      = 15 * toint(Branch == "ScheduledTask"),
+    Score_TrustedParent   = 10 * toint(Branch == "TrustedParent"),
+    Score_HighValueTarget = 20 * TargetHighValue,
+    Score_WritablePath    = 15 * PointsWritablePath,
+    Score_InjHints        = 10 * HasInjectionHints,
+    Score_GhostModule     = 15 * coalesce(GhostModule, 0),
+    Score_Beacon          = 10 * HasBeacon,
+    Score_SuspPort        = 5  * SuspPort,
+    Score_Rare            = 10 * ProcIsRare,
+    RiskScore = BaseScore
+      + Score_TaskBranch + Score_TrustedParent
+      + Score_HighValueTarget + Score_WritablePath
+      + Score_InjHints + Score_GhostModule
+      + Score_Beacon + Score_SuspPort
+      + Score_Rare,
+    RiskLevel = case(RiskScore >= 120, "CRITICAL", RiskScore >= 90, "HIGH", RiskScore >= 70, "MEDIUM", "LOW")
+
+| where RiskLevel in ("MEDIUM","HIGH","CRITICAL")
+
+// ============================================================================
+// Output (SOC-ready)
+// ============================================================================
+
+| extend HunterDirective = case(
+    RiskLevel=="CRITICAL" and Branch=="ScheduledTask",
+      "CRITICAL: Task-executed loader → injection chain. Pull task name/definition (if available), scope for same task + loader hash across fleet, collect referenced payload, isolate host if unauthorized.",
+    RiskLevel=="CRITICAL",
+      "CRITICAL: Trusted-parent/loader → injection into high-value process. Contain, capture memory if possible, triage target process (LSASS/winlogon/etc), pivot on loader hash + parent lineage + first beacon destination.",
+    RiskLevel=="HIGH",
+      "HIGH: Loader-to-injection chain with strong reinforcement. Validate legitimacy of loader path and signer, pivot to recent file drops in writable dirs, check outbound comms for C2 patterns.",
+    "MEDIUM: Injection-aligned behavior chain. Review process ancestry, validate task/parent legitimacy, and hunt for repeat on other devices."
+)
+
+| project
+    LoaderTime, InjectTime,
+    DeviceName, DeviceId,
+    Branch,
+    AccountName,
+    ParentFile, ParentCmd,
+    LoaderFile, LoaderPath, LoaderCmd, LoaderSHA256,
+    InjectorFile=InjectorFile, InjectorCmd=InjectorCmd,
+    TargetProcess, TargetHighValue,
+    ImageLoaded, ImagePath, GhostModule,
+    NetTime, RemoteIP, RemoteUrl, RemotePort, Protocol,
+    ProcDeviceCount, ProcIsRare,
+    RiskScore, RiskLevel,
+    HunterDirective
+| order by RiskScore desc, LoaderTime desc
