@@ -1,0 +1,165 @@
+//////////////////////////////////////////////////////////////////////////////////
+// SilverFox / ValleyRAT – Sideload + BYOVD Chain (Framework-Aligned Revision)
+// Author: Ala Dabat
+//
+// FRAMEWORK
+// Minimum Truth: Kernel driver load confirmation (DriverLoadEvent) from suspicious context.
+// Reinforcement:
+//   R1: Service registration indicators (registry ImagePath OR process hints)
+//   R2: Driver-like artifact staging into writable / anomalous paths
+//   R3: Signed loader abuse + suspicious module load (signer mismatch / unsigned module / anomalous path)
+// Notes:
+//   - Avoid brittle "same folder" assumptions.
+//   - Keep behaviour-first: do not rely on hash TI as truth.
+// Tables: DeviceImageLoadEvents, DeviceFileEvents, DeviceRegistryEvents, DeviceProcessEvents, DeviceEvents
+// MITRE: T1574.002, T1543.003, T1068, T1562.001, T1027
+//////////////////////////////////////////////////////////////////////////////////
+
+let Lookback = 24h;
+
+let SideloadToDropWindow   = 6h;
+let DropToServiceWindow    = 2h;
+let ServiceToKernelWindow  = 2h;
+
+// Expanded writable/anomalous locations seen in real-world ops (still tune per tenant)
+let WritablePaths = dynamic([
+  "\\Temp\\","\\ProgramData\\","\\Users\\","\\Public\\","\\Desktop\\","\\Downloads\\","\\AppData\\",
+  "\\PerfLogs\\","\\Windows\\Tasks\\","\\Windows\\System32\\Tasks\\","\\Windows\\Fonts\\",
+  "\\Windows\\System32\\spool\\drivers\\color\\"
+]);
+
+let ModuleExtRegex = @"\.(dll|ocx|cpl|dat|bin|tmp)$";
+let DriverExtRegex = @"\.(sys|drv|dat|bin|tmp|ax)$";
+
+// Reinforcement R3: suspicious module load patterns
+let SuspiciousModuleLoads =
+DeviceImageLoadEvents
+| where Timestamp > ago(Lookback)
+| where FileName matches regex ModuleExtRegex
+| extend LoaderSigned = tostring(InitiatingProcessSignatureStatus) == "Signed"
+| extend ModuleSigned = tostring(SignatureStatus) == "Signed"
+| extend LoaderPath = tolower(tostring(InitiatingProcessFolderPath))
+| extend ModPath    = tolower(tostring(FolderPath))
+| where LoaderSigned
+// suspicious if module unsigned OR signer mismatch OR module loads from writable/anomalous path
+| where (not(ModuleSigned) or Signer != InitiatingProcessSigner or ModPath has_any (WritablePaths))
+| project
+    DeviceId,
+    SideloadTime = Timestamp,
+    LoaderName   = InitiatingProcessFileName,
+    LoaderPath   = InitiatingProcessFolderPath,
+    LoaderPid    = InitiatingProcessId,
+    LoaderSigner = tostring(InitiatingProcessSigner),
+    LoadedModule = FileName,
+    LoadedModulePath = FolderPath,
+    LoadedSigStatus = tostring(SignatureStatus),
+    LoadedSigner = tostring(Signer);
+
+// Reinforcement R2: driver-like staging
+let DriverDrops =
+DeviceFileEvents
+| where Timestamp > ago(Lookback)
+| where ActionType in ("FileCreated","FileModified","FileRenamed","FileMoved")
+| where FolderPath has_any (WritablePaths)
+| where FileName matches regex DriverExtRegex
+| project
+    DeviceId,
+    DropTime = Timestamp,
+    DriverFile = FileName,
+    DriverFolder = FolderPath,
+    DropperPid = InitiatingProcessId,
+    DropperProc = InitiatingProcessFileName,
+    DropperCmd  = InitiatingProcessCommandLine;
+
+// Reinforcement R1: service registration (registry is strongest)
+let ServiceRegistry =
+DeviceRegistryEvents
+| where Timestamp > ago(Lookback)
+| where RegistryKey has @"System\CurrentControlSet\Services"
+| where RegistryValueName in~ ("ImagePath","ServiceDll")
+| where RegistryValueData has_any (WritablePaths)
+| where RegistryValueData matches regex @"\.(sys|drv|dat|bin|tmp|dll)\b"
+| project
+    DeviceId,
+    ServiceTime = Timestamp,
+    ServiceIndicator = RegistryKey,
+    ServiceValue = RegistryValueData,
+    ServicePid = InitiatingProcessId,
+    Method = "Registry";
+
+let ServiceProcessHints =
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| where FileName in~ ("sc.exe","pnputil.exe","powershell.exe","pwsh.exe","wmic.exe","rundll32.exe","reg.exe")
+| where isnotempty(ProcessCommandLine)
+| where ProcessCommandLine has_any (WritablePaths)
+| where (
+    (FileName =~ "sc.exe" and ProcessCommandLine has "create")
+    or (FileName in~ ("powershell.exe","pwsh.exe") and ProcessCommandLine has_any ("New-Service","CreateService","Start-Service","NtLoadDriver"))
+    or (FileName =~ "wmic.exe" and ProcessCommandLine has_any ("service","create"))
+    or (FileName =~ "pnputil.exe" and ProcessCommandLine has_any ("/add-driver","/install"))
+    or (FileName =~ "rundll32.exe" and ProcessCommandLine has_any ("setupapi.dll","InstallHinfSection"))
+    or (FileName =~ "reg.exe" and ProcessCommandLine has_any ("CurrentControlSet\\Services","ServiceDll","ImagePath"))
+  )
+| project
+    DeviceId,
+    ServiceTime = Timestamp,
+    ServiceIndicator = ProcessCommandLine,
+    ServiceValue = "",
+    ServicePid = ProcessId,
+    Method = "ProcessHint";
+
+let DriverServiceCreates = union ServiceRegistry, ServiceProcessHints;
+
+// Minimum Truth: actual kernel driver load (ground truth)
+let KernelDriverLoads =
+DeviceEvents
+| where Timestamp > ago(Lookback)
+| where ActionType == "DriverLoadEvent"
+| project
+    DeviceId,
+    KernelLoadTime = Timestamp,
+    KernelDriverName = FileName,
+    KernelDriverPath = FolderPath;
+
+// Correlate chain (device-scoped; avoid brittle PID requirements)
+SuspiciousModuleLoads
+| join kind=inner (DriverDrops) on DeviceId
+| where DropTime between (SideloadTime .. SideloadTime + SideloadToDropWindow)
+| join kind=inner (DriverServiceCreates) on DeviceId
+| where ServiceTime between (DropTime .. DropTime + DropToServiceWindow)
+| join kind=inner (KernelDriverLoads) on DeviceId
+| where KernelLoadTime between (ServiceTime .. ServiceTime + ServiceToKernelWindow)
+| summarize
+    FirstSeen        = min(SideloadTime),
+    LastSeen         = max(KernelLoadTime),
+    LoaderName       = any(LoaderName),
+    LoaderPath       = any(LoaderPath),
+    LoaderSigner     = any(LoaderSigner),
+    LoadedModules    = make_set(LoadedModule, 10),
+    LoadedSigners    = make_set(LoadedSigner, 10),
+    LoadedSigStatus  = make_set(LoadedSigStatus, 5),
+    DriverFiles      = make_set(DriverFile, 10),
+    DriverFolders    = make_set(DriverFolder, 10),
+    ServiceMethods   = make_set(Method, 5),
+    ServiceIndicators= make_set(ServiceIndicator, 10),
+    KernelDrivers    = make_set(KernelDriverName, 10),
+    KernelPaths      = make_set(KernelDriverPath, 10),
+    DropperProcs     = make_set(DropperProc, 10),
+    SampleDropperCmd = any(DropperCmd)
+  by DeviceId
+| extend RiskScore = 95, Severity = "CRITICAL"
+| extend HuntingDirectives = pack_array(
+    "[MIN_TRUTH] Kernel driver load observed after suspicious registration chain.",
+    strcat("[SIDeload] Loader=", LoaderName, " (", LoaderSigner, ") | Path=", LoaderPath),
+    strcat("[MODULE] Loaded=", tostring(LoadedModules), " | Sig=", tostring(LoadedSigStatus), " | Signers=", tostring(LoadedSigners)),
+    strcat("[STAGE] Driver-like=", tostring(DriverFiles), " | Paths=", tostring(DriverFolders)),
+    strcat("[SERVICE] Methods=", tostring(ServiceMethods)),
+    "ACTION: Isolate host. Acquire driver/module artifacts. Validate EDR health & tamper events. Scope estate by LoaderName/LoadedModules/DriverFiles + paths.",
+    "PIVOT: Search DeviceRegistryEvents for additional Services keys written near FirstSeen. Pivot DeviceProcessEvents for parent lineage and initial access."
+)
+| project FirstSeen, LastSeen, Severity, RiskScore, DeviceId,
+          LoaderName, LoaderPath, LoaderSigner, LoadedModules, LoadedSigStatus, LoadedSigners,
+          DriverFiles, DriverFolders, ServiceMethods, KernelDrivers, KernelPaths, DropperProcs,
+          SampleDropperCmd, HuntingDirectives
+| order by LastSeen desc
