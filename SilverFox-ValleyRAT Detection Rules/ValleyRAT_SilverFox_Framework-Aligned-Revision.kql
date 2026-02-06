@@ -1,0 +1,125 @@
+//////////////////////////////////////////////////////////////////////////////////////////
+// SilverFox / ValleyRAT – Script Stager Hunt (Framework-Aligned Revision)
+// Author: Ala Dabat
+// Purpose: Behavioural detection of early-stage stagers that either:
+//   (A) perform ingress semantics -> stage artifacts to writable paths (drop-based), OR
+//   (B) perform fileless remote execution (no drop required)
+//
+// FRAMEWORK
+// Minimum Truth (A): Script/LOLBin with ingress semantics AND near-time payload staging.
+// Minimum Truth (B): Script host performing remote fetch + execution semantics (fileless).
+// Reinforcement: suspicious parents, writable paths, encoded/obfuscated exec, near-time network pivots.
+//
+// Tables: DeviceProcessEvents, DeviceFileEvents
+// MITRE: T1105, T1059, T1027, T1204.002
+//////////////////////////////////////////////////////////////////////////////////////////
+
+let Lookback     = 48h;
+let CorrWindow   = 45m;
+let ChildWindow  = 15m;
+
+let WritablePaths = dynamic([
+  "\\Users\\","\\Downloads\\","\\Desktop\\","\\Temp\\","\\ProgramData\\","\\Public\\","\\AppData\\",
+  "\\Windows\\Tasks\\","\\Windows\\System32\\Tasks\\",
+  "\\Windows\\System32\\spool\\drivers\\color\\",
+  "\\PerfLogs\\"
+]);
+
+let StagedArtifactExtRegex = @"\.(exe|dll|sys|dat|bin|tmp|scr|cab|msi|iso|img|vbs|vbe|js|jse|wsf|ps1|bat|cmd|lnk|cpl|msc|vhd|vhdx)$";
+
+// Ingress semantics across common tooling (keep behavioural, not family-specific)
+let DownloadTokens = dynamic([
+  "iwr","Invoke-WebRequest","Invoke-RestMethod","DownloadFile","DownloadString","Net.WebClient",
+  "Start-BitsTransfer","bitsadmin","urlcache","-split","ADODB.Stream","XMLHTTP",
+  "curl.exe","msiexec","URLDownloadToFile","WinHTTP","tar.exe","expand"
+]);
+
+// Fileless remote execution semantics (no drop required)
+let FilelessExecTokens = dynamic([
+  "-encodedcommand"," frombase64string","iex(","invoke-expression","eval(","executeglobal","fromcharcode"
+]);
+
+let ScriptEvents =
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| where FileName in~ ("powershell.exe","pwsh.exe","cmd.exe","mshta.exe","wscript.exe","cscript.exe","certutil.exe","bitsadmin.exe","msiexec.exe","curl.exe")
+| where isnotempty(ProcessCommandLine)
+| extend Cmd = tolower(ProcessCommandLine)
+| where Cmd has_any (DownloadTokens) or (Cmd has_any (FilelessExecTokens) and Cmd has_any ("http://","https://","ftp://","\\\\"))
+| project
+    DeviceId,
+    ScriptTime      = Timestamp,
+    ScriptPid       = ProcessId,
+    ScriptName      = FileName,
+    ScriptCmd       = ProcessCommandLine,
+    ScriptParent    = InitiatingProcessFileName,
+    ScriptParentPid = InitiatingProcessId,
+    ScriptAccount   = coalesce(AccountUpn, InitiatingProcessAccountUpn, AccountName, InitiatingProcessAccountName);
+
+let ScriptChildren =
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| project DeviceId, ChildTime=Timestamp, ChildPid=ProcessId, ChildName=FileName, ChildCmd=ProcessCommandLine, ParentPid=InitiatingProcessId
+| join kind=inner (ScriptEvents) on DeviceId
+| where ParentPid == ScriptPid
+| where ChildTime between (ScriptTime .. ScriptTime + ChildWindow)
+| project DeviceId, ScriptTime, ScriptPid, ScriptName, ScriptCmd, ScriptParent, ScriptParentPid, ScriptAccount,
+          ChildPid, ChildName, ChildCmd, ChildTime;
+
+let FileDrops =
+DeviceFileEvents
+| where Timestamp > ago(Lookback)
+| where ActionType in ("FileCreated","FileModified","FileRenamed","FileMoved")
+| where FolderPath has_any (WritablePaths)
+| where FileName matches regex StagedArtifactExtRegex
+| project
+    DeviceId,
+    DropTime    = Timestamp,
+    DroppedFile = FileName,
+    DropPath    = FolderPath,
+    DropperPid  = InitiatingProcessId,
+    DropperProc = InitiatingProcessFileName,
+    DropperCmd  = InitiatingProcessCommandLine,
+    DropperAccount = coalesce(InitiatingProcessAccountUpn, InitiatingProcessAccountName);
+
+// Branch A: Drop-based staging correlation
+let DropBased =
+ScriptEvents
+| join kind=inner (FileDrops) on DeviceId
+| where DropTime between (ScriptTime .. ScriptTime + CorrWindow)
+| join kind=leftouter (ScriptChildren) on DeviceId, ScriptPid
+| extend IsChildDropper = iif(DropperPid == ChildPid, 1, 0)
+| where (DropperPid == ScriptPid) or (IsChildDropper == 1)
+| extend Branch = "DropBased";
+
+// Branch B: Fileless (no drop) – treat as truth when remote + exec semantics present
+let Fileless =
+ScriptEvents
+| extend Cmd = tolower(ScriptCmd)
+| where Cmd has_any (FilelessExecTokens) and Cmd has_any ("http://","https://","ftp://","\\\\")
+| extend Branch = "Fileless";
+
+union DropBased, Fileless
+| summarize
+    FirstSeen    = min(ScriptTime),
+    LastSeen     = max(coalesce(DropTime, ScriptTime)),
+    Branches     = make_set(Branch, 5),
+    ScriptNames  = make_set(ScriptName, 5),
+    Parents      = make_set(ScriptParent, 8),
+    SampleCmd    = any(ScriptCmd),
+    ChildProcs   = make_set(ChildName, 10),
+    DroppedFiles = make_set(DroppedFile, 15),
+    DropPaths    = make_set(DropPath, 10),
+    Droppers     = make_set(DropperProc, 10)
+  by DeviceId
+| extend Severity = case(array_length(Branches) > 0 and "Fileless" in (Branches), "HIGH", "MEDIUM")
+| extend HuntingDirectives = pack_array(
+    strcat("[MIN_TRUTH] Script stager detected (", tostring(Branches), ")."),
+    strcat("[PROC] Scripts=", tostring(ScriptNames), " | Parents=", tostring(Parents)),
+    strcat("[CMD] ", substring(tostring(SampleCmd), 0, 260)),
+    strcat("[DROP] Files=", tostring(DroppedFiles), " | Paths=", tostring(DropPaths), " | Droppers=", tostring(Droppers)),
+    "PIVOT: DeviceNetworkEvents around FirstSeen/LastSeen for outbound domains/IPs from Script/Child lineage.",
+    "PIVOT: DeviceProcessEvents after FirstSeen for execution of dropped artifacts or follow-on persistence creation."
+)
+| project FirstSeen, LastSeen, Severity, DeviceId, Branches, ScriptNames, Parents, DroppedFiles, DropPaths, ChildProcs, HuntingDirectives
+| order by FirstSeen desc
