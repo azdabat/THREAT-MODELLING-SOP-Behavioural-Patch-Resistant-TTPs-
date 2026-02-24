@@ -14,7 +14,7 @@ The objective is to provide a mature, repeatable methodology for modelling threa
 > **Migration Path:**
 > Once a detection logic is validated, refined, and normalized for operational use, it is promoted to the **Composite Rules** repository.
 >
->  **For finished, production-ready rules, please visit:**
+>  **For finished, ADX-Tested rules, please visit:**
 > [**Composite Threat Hunting Rules**](https://github.com/azdabat/Composite-Threat-Hunting-Rules)
 
 Most enterprise detection strategies revolve around signatures, IOCs, and individual CVEs. Those no longer provide meaningful defence against long-term, iterative adversaries such as ransomware crews, identity-centric attackers, and modern loader ecosystems.  
