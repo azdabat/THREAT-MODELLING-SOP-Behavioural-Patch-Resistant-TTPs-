@@ -1,0 +1,99 @@
+# Composite Sensor — Python_subprocess_Abuse
+
+**Architecture:** 1 — Composite Sensor  
+**Author:** Ala Dabat | MTDF 2026  
+**MITRE ATT&CK:** T1059.006 — Python  
+**Platform:** MDE Advanced Hunting — Linux + Windows  
+**Lifecycle:** Production-Candidate (ADX validation pending)  
+**Base Score:** 55 · **Threshold:** ≥ 75  
+**Anchoring:** Intent-First  
+
+---
+
+## Purpose
+
+High-confidence production alert for Python web application RCE via subprocess abuse. Fires when a Python WSGI/ASGI worker (`gunicorn`, `uwsgi`, `uvicorn`) or a web-serving Python process spawns a shell, downloader, or interpreter with RCE-indicative command-line content.
+
+---
+
+## Why Composite and Not Router Rule
+
+Python web server processes have a **single noise domain**: WSGI/ASGI worker processes serving HTTP requests.
+
+`gunicorn` spawns Python worker processes — not bash shells. `uvicorn` handles async requests — not curl downloads. The suppression model is consistent: data science environments (Jupyter, Anaconda) receive a soft penalty because Jupyter kernels legitimately spawn subprocesses.
+
+**Single noise domain → composite.**
+
+> **Important caveat:** If your environment has heavy Jupyter/notebook usage on the same hosts as production web servers, consider adding a Router Rule to separate the two Python contexts. The `-25` soft penalty may not be sufficient in high-volume notebook environments.
+
+---
+
+## Attack Vectors Covered
+
+| Attack Type | Framework | Example Sink |
+|-------------|-----------|-------------|
+| Command injection | Flask/Django | `os.system(request.args.get('cmd'))` |
+| SSTI (Server-Side Template Injection) | Jinja2 | `{{config.__class__.__init__.__globals__['os'].popen('bash')}}` |
+| Pickle deserialisation | Any | `pickle.loads(user_controlled_data)` |
+| Python eval/exec injection | Any | `eval(user_input)` |
+| Subprocess with user input | Flask/Django | `subprocess.call(user_controlled_string, shell=True)` |
+
+---
+
+## Unique Signal — `HasSubprocessArg`
+
+Python-specific signal: when the initiating Python process command line contains subprocess invocation patterns (`os.system(`, `subprocess.call(`, `subprocess.Popen(`), this is a direct code-level indicator of the exploit sink.
+
+```
+HasSubprocessArg — Python subprocess sink in parent cmdline
+Scores: +20
+Triggers on: os.system(, subprocess.call(, subprocess.run(, __import__('os')
+```
+
+This is particularly valuable for detecting SSTI and eval injection where the parent Python process command line contains the injected payload.
+
+---
+
+## Scoring
+
+| Signal | Score | Why |
+|--------|-------|-----|
+| Base (minimum truth) | +55 | gunicorn/uwsgi → shell = structural truth |
+| Reverse shell pattern | +30 | `/dev/tcp/` = near-certain C2 |
+| Windows PowerShell cradle | +30 | IEX from Python = Windows RCE |
+| Pipe-to-shell | +25 | Download-and-execute chain |
+| Remote URL | +20 | External staging |
+| Subprocess sink in parent | +20 | Python-specific code sink indicator |
+| Base64/encoded | +15 | Obfuscation |
+| Data science context | -25 | Jupyter/Anaconda = legitimate subprocess |
+
+---
+
+## When It Fires
+
+- `gunicorn` spawns `bash` with `/dev/tcp/` → **CRITICAL (85)**
+- `uvicorn` spawns `curl` with remote URL → **MEDIUM (75)**
+- `python3` spawns `bash` with `subprocess.call(` in parent cmdline → **HIGH (80)**
+
+---
+
+## Framework-Specific Investigation
+
+| Framework | Vulnerable Pattern | Where to Look |
+|-----------|-------------------|---------------|
+| Flask | `os.system(request.args['cmd'])` | Route handlers with OS calls |
+| Django | `subprocess.call(request.POST['cmd'], shell=True)` | View functions |
+| FastAPI | SSTI in Jinja2 templates | Template files |
+| Any | `pickle.loads(user_data)` | Deserialisation endpoints |
+
+---
+
+## Ecosystem Position
+
+```
+Web Application Runtime RCE Family:
+NodeJS_SuspiciousChildProcesses  ✅
+PHP_exec_Abuse                   ✅
+Python_subprocess_Abuse          ✅ (this rule)
+Java_Runtime_Exec_Abuse          🔴 Router → 4 pending composites
+```
