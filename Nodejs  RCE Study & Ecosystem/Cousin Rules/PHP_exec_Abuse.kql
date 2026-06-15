@@ -1,0 +1,201 @@
+// ============================================================================
+// COMPOSITE SENSOR: PHP_exec_Abuse (Cross-Platform)
+// ============================================================================
+// Architecture  : Composite Sensor (Architecture 1 — Inference: HIGH)
+// Author        : Ala Dabat | MTDF 2026
+// Platform      : MDE Advanced Hunting — Linux + Windows
+// Lifecycle     : Production-Candidate (ADX validation pending)
+// MITRE         : T1059.004 — Unix Shell · T1059.007 (web scripting variant)
+// Anchoring     : Intent-First
+// Base          : 55 · Threshold : >= 75
+//
+// MINIMUM TRUTH ANCHOR:
+//   PHP process (php, php-fpm, php-cgi) spawning a shell, downloader,
+//   or interpreter — the irreducible web application RCE substrate.
+//   PHP alone is ubiquitous. The child process is the anchor.
+//
+// INDEPENDENT SENSOR: No cross-table joins at Phase 1.
+//   Correlation happens at the incident layer via DeviceId entity key.
+//   Ghost chains produce false certainty. Independent sensors produce truth.
+//
+// PRIMITIVE BACKING: PC_PHP_ChildProcess_Atomic (build alongside)
+//
+// WHY COMPOSITE NOT ROUTER:
+//   PHP exec() abuse has a SINGLE noise domain: web server processes.
+//   Apache/Nginx/php-fpm spawning shells is structurally abnormal.
+//   Unlike Node.js (where curl/bash/python each have different noise profiles),
+//   ALL PHP child processes share the same suppression model:
+//   web server worker + developer tooling context.
+//   Single noise domain = composite, not router.
+//
+// COUSIN SENSORS (web application runtime RCE family):
+//   - NodeJS_SuspiciousChildProcesses (T1059.007) ✅ BUILT
+//   - Python_subprocess_Abuse (T1059.006) 🔴 See cousin rule
+//   - Java_Runtime_Exec_Abuse (T1059) 🔴 See cousin rule
+//
+// MINIMUM FIRE PATHS:
+//   Base 55 + HasReverseShell 30  = 85 >= 75 ✓
+//   Base 55 + HasPipeToShell 25   = 80 >= 75 ✓
+//   Base 55 + HasRemoteURL 20     = 75 >= 75 ✓
+//   Base 55 + HasWindowsCradle 30 = 85 >= 75 ✓ (Windows IIS/PHP)
+// ============================================================================
+
+let lookback = 7d;
+
+// PHP process variants — all web-facing PHP execution contexts
+let PHPProcesses = dynamic([
+    "php", "php5", "php7", "php8",
+    "php-fpm", "php-fpm7", "php-fpm8",   // FastCGI Process Manager
+    "php-cgi",                             // CGI mode
+    "php.exe"                              // Windows PHP
+]);
+
+// Known-legitimate PHP children — package management, tooling
+let LegitPHPChildren = dynamic([
+    "composer", "composer.phar",
+    "php", "php.exe",                     // PHP calling itself (includes/requires)
+    "phpunit",
+    "artisan"                              // Laravel Artisan CLI
+]);
+
+// Dangerous child categories
+let Shells_Linux       = dynamic(["bash","dash","sh","zsh","fish","busybox"]);
+let Downloaders_Linux  = dynamic(["curl","wget","nc","ncat","socat","fetch"]);
+let Interpreters_Linux = dynamic(["python","python2","python3","perl","ruby","lua"]);
+let WinSuspChildren    = dynamic([
+    "powershell.exe","pwsh.exe","cmd.exe",
+    "certutil.exe","bitsadmin.exe","mshta.exe","wscript.exe"
+]);
+
+// RCE command-line primitives
+let ReverseShellTokens = dynamic([
+    "/dev/tcp/", "exec 5<>", "socket.socket(",
+    "subprocess.call(", "os.dup2("
+]);
+let PipeToShellTokens = dynamic([
+    "| bash", "| sh", "| dash", "| zsh",
+    "| perl", "| python", "| python3"
+]);
+
+// ── PHASE 1: MINIMUM TRUTH ───────────────────────────────────────────────────
+// WHY: php-fpm spawning bash is the irreducible RCE substrate.
+// Apache/Nginx workers spawn PHP via FastCGI — not shells.
+// Any php* process spawning a shell = code execution outside the sandbox.
+// This is the webshell post-exploitation footprint.
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| where InitiatingProcessFileName in~ (PHPProcesses)
+| where not(FileName in~ (LegitPHPChildren))
+| where FileName in~ (Shells_Linux)
+     or FileName in~ (Downloaders_Linux)
+     or FileName in~ (Interpreters_Linux)
+     or FileName in~ (WinSuspChildren)
+
+// ── PHASE 2: NATIVE ENRICHMENT ───────────────────────────────────────────────
+// [FIX-8] toint() on all boolean signal flags
+| extend
+    IsLinux   = toint(not(FileName endswith ".exe")),
+    IsWindows = toint(FileName endswith ".exe"),
+
+    // [TECHNIQUE] Reverse shell patterns
+    HasReverseShell  = toint(ProcessCommandLine has_any (ReverseShellTokens)),
+
+    // [TECHNIQUE] Pipe-to-shell download-and-execute
+    HasPipeToShell   = toint(ProcessCommandLine has_any (PipeToShellTokens)),
+
+    // [TECHNIQUE] Remote URL — staging or C2
+    HasRemoteURL     = toint(ProcessCommandLine matches regex
+                         @"\b(https?|ftp|ftps)://[^\s'""]+"),
+
+    // [OBFUSCATION] Base64 encoded payload
+    HasBase64        = toint(ProcessCommandLine has_any (
+                         "-enc", "-EncodedCommand",
+                         "base64 -d", "base64 --decode")),
+
+    // [TECHNIQUE] Windows PowerShell cradle from PHP (IIS/Windows PHP)
+    HasWindowsCradle = toint(FileName in~ ("powershell.exe","pwsh.exe")
+                         and ProcessCommandLine has_any (
+                             "IEX","Invoke-Expression",
+                             "New-Object Net.WebClient","DownloadString",
+                             "Invoke-WebRequest","iwr",
+                             "-ExecutionPolicy Bypass")),
+
+    // [TECHNIQUE] Webshell indicator — command passed via PHP superglobals
+    // Common webshell patterns: system($_GET['cmd']), exec($_POST['c'])
+    HasWebshellArg   = toint(InitiatingProcessCommandLine has_any (
+                         "$_GET", "$_POST", "$_REQUEST", "$_SERVER",
+                         "system(", "exec(", "passthru(", "shell_exec(",
+                         "popen(", "proc_open(")),
+
+    // [SUPPRESSION] Known-legitimate PHP execution contexts
+    // Soft penalty only — never hard exclusion
+    IsDevContext     = toint(
+                         InitiatingProcessFolderPath has_any (
+                             "/home/vagrant", "/home/ubuntu/",
+                             "C:\\xampp\\", "C:\\wamp\\",
+                             "/opt/lampp/")
+                         or AccountName has_any (
+                             "www-data", "apache", "nginx",
+                             "httpd", "iis apppool"))
+
+// ── PHASE 3: CONVERGENCE SCORING ─────────────────────────────────────────────
+// SCORING DECISION TABLE:
+// ┌────────────────────────┬────────┬───────────────────────────────────────┐
+// │ Signal                 │ Points │ Rationale                             │
+// ├────────────────────────┼────────┼───────────────────────────────────────┤
+// │ Base (minimum truth)   │   55   │ php-fpm → shell = structural RCE      │
+// │ HasReverseShell        │   30   │ /dev/tcp/ = near-certain C2           │
+// │ HasWindowsCradle       │   30   │ IEX from PHP = confirmed Windows RCE  │
+// │ HasPipeToShell         │   25   │ Pipe to interpreter = exec chain      │
+// │ HasRemoteURL           │   20   │ External URL = staging indicator      │
+// │ HasWebshellArg         │   20   │ PHP superglobal = webshell pattern    │
+// │ HasBase64              │   15   │ Encoded payload = obfuscation         │
+// │ IsDevContext (penalty) │  -20   │ Local dev (XAMPP/WAMP) = soft down   │
+// └────────────────────────┴────────┴───────────────────────────────────────┘
+| extend RawScore = 55
+    + iff(HasReverseShell == 1,    30, 0)
+    + iff(HasWindowsCradle == 1,   30, 0)
+    + iff(HasPipeToShell == 1,     25, 0)
+    + iff(HasRemoteURL == 1,       20, 0)
+    + iff(HasWebshellArg == 1,     20, 0)
+    + iff(HasBase64 == 1,          15, 0)
+    - iff(IsDevContext == 1,       20, 0)
+// [FIX-10] Score floor at zero
+| extend RiskScore = iif(RawScore < 0, 0, RawScore)
+| where RiskScore >= 75
+
+// ── PHASE 4: HUNTER DIRECTIVE ────────────────────────────────────────────────
+// [FIX-DIRECTIVE] Defined BEFORE project, included in project list
+// Schema Confidence: All fields confirmed from MDE DeviceProcessEvents schema.
+// No hallucinated fields.
+| extend HunterDirective = case(
+    RiskScore >= 110,
+        strcat("CRITICAL — PHP RCE CONFIRMED | ",
+               "php-fpm/php-cgi spawned shell with RCE payload. ",
+               "Score=", tostring(RiskScore), " | ",
+               "ACTIONS: 1. ISOLATE ", DeviceName, " immediately. ",
+               "2. Search web root for webshell files (*.php with exec/system). ",
+               "3. Check web server access logs for exploit request. ",
+               "4. Pivot DeviceNetworkEvents on DeviceId for C2 connections. ",
+               "5. Review AccountName=", AccountName, " for lateral movement."),
+    RiskScore >= 90,
+        strcat("HIGH — PHP CHILD PROCESS ABUSE | Score=", tostring(RiskScore),
+               " | Review command line. Identify webshell or vulnerable endpoint. ",
+               "Check web server logs for source request on ", DeviceName),
+    strcat("MEDIUM — PHP SPAWNED UNUSUAL PROCESS | Score=", tostring(RiskScore),
+           " | Verify developer context. If production server: escalate immediately.")
+)
+// [FIX-1] arg_max for deterministic output
+| summarize arg_max(Timestamp, *) by DeviceId, AccountName, FileName
+| project
+    Timestamp, DeviceName, AccountName,
+    PHPProcess       = InitiatingProcessFileName,
+    PHPCmdLine       = InitiatingProcessCommandLine,
+    ChildProcess     = FileName,
+    ChildCmdLine     = ProcessCommandLine,
+    RiskScore,
+    HasReverseShell, HasPipeToShell, HasRemoteURL,
+    HasBase64, HasWindowsCradle, HasWebshellArg,
+    IsDevContext, IsLinux, IsWindows,
+    HunterDirective
+| sort by RiskScore desc
