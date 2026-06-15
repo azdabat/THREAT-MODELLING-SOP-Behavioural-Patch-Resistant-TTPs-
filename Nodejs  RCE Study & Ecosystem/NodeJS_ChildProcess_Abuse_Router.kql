@@ -1,0 +1,95 @@
+// ============================================================================
+// ROUTER RULE: NodeJS_ChildProcess_Abuse_Router
+// ============================================================================
+// Architecture : Router Rule (Architecture 2 — Triage Surface)
+// Author       : Ala Dabat | MTDF 2026
+// Platform     : MDE Advanced Hunting — Linux + Windows
+// Lifecycle    : Router (Temporary)
+// MITRE        : T1059.007
+// Base         : 0 · Threshold : >= 30
+//
+// WHY ROUTER RULE: Different child tools have different noise domains.
+//   bash (CI/CD), curl (health checks), python (pipelines) all require
+//   separate suppression models — cannot share a single composite.
+//
+// DECOMPOSITION TRACKER:
+//   Node → bash/sh/dash     | NodeJS_Bash_RCE        | 🔴 Pending
+//   Node → curl/wget/nc     | NodeJS_Downloader_RCE  | 🔴 Pending
+//   Node → python/ruby/perl | NodeJS_Interpreter_RCE | 🔴 Pending
+//   Node → powershell.exe   | NodeJS_PowerShell_RCE  | 🔴 Pending
+//   Node → certutil/mshta   | NodeJS_LOLBin_RCE      | 🔴 Pending
+// ============================================================================
+
+let lookback = 7d;
+
+let ShellGroup     = dynamic(["bash","dash","sh","zsh","busybox","fish"]);
+let DownloadGroup  = dynamic(["curl","wget","nc","ncat","socat"]);
+let InterpreterGrp = dynamic(["python","python2","python3","perl","ruby","lua"]);
+let WindowsCradle  = dynamic(["powershell.exe","pwsh.exe","cmd.exe"]);
+let WindowsLOLBins = dynamic(["certutil.exe","bitsadmin.exe","mshta.exe","wscript.exe"]);
+let ManagedParents = dynamic([
+    "ccmexec.exe","intunemanagementextension.exe","taniumclient.exe"
+]);
+let ReverseShellTokens = dynamic(["/dev/tcp/","exec 5<>","socket.socket("]);
+let PipeToShellTokens  = dynamic(["| bash","| sh","| dash","| zsh","| perl","| python"]);
+
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| where InitiatingProcessFileName in~ ("node", "node.exe")
+| where FileName in~ (ShellGroup)
+     or FileName in~ (DownloadGroup)
+     or FileName in~ (InterpreterGrp)
+     or FileName in~ (WindowsCradle)
+     or FileName in~ (WindowsLOLBins)
+| extend
+    IsShell       = toint(FileName in~ (ShellGroup)),
+    IsDownloader  = toint(FileName in~ (DownloadGroup)),
+    IsInterpreter = toint(FileName in~ (InterpreterGrp)),
+    IsWinCradle   = toint(FileName in~ (WindowsCradle)),
+    IsWinLOLBin   = toint(FileName in~ (WindowsLOLBins)),
+    HasReverseShell  = toint(ProcessCommandLine has_any (ReverseShellTokens)),
+    HasPipeToShell   = toint(ProcessCommandLine has_any (PipeToShellTokens)),
+    HasRemoteURL     = toint(ProcessCommandLine matches regex
+                         @"\b(https?|ftp)://[^\s]+"),
+    HasBase64        = toint(ProcessCommandLine has_any ("-enc","base64 -d")),
+    HasWinCradleCmd  = toint(IsWinCradle == 1
+                         and ProcessCommandLine has_any (
+                             "IEX","DownloadString","Invoke-WebRequest")),
+    IsManagedParent  = toint(InitiatingProcessFileName in~ (ManagedParents))
+| extend RawScore = 0
+    + iff(HasReverseShell == 1,   40, 0)
+    + iff(HasPipeToShell == 1,    30, 0)
+    + iff(HasRemoteURL == 1,      25, 0)
+    + iff(HasBase64 == 1,         20, 0)
+    + iff(HasWinCradleCmd == 1,   20, 0)
+    + iff(IsShell == 1,           10, 0)
+    - iff(IsManagedParent == 1,   15, 0)
+| extend RiskScore = iif(RawScore < 0, 0, RawScore)
+| where RiskScore >= 30
+| extend RoutingDirective = case(
+    HasReverseShell == 1,
+        strcat("CRITICAL → NodeJS_Bash_RCE composite | Reverse shell on ",
+               DeviceName, " | Composite pending — use NodeJS_SuspiciousChildProcesses"),
+    IsShell == 1 and (HasPipeToShell == 1 or HasBase64 == 1),
+        "HIGH → NodeJS_Bash_RCE composite | Shell with pipe or encoded payload",
+    IsDownloader == 1 and HasRemoteURL == 1,
+        "HIGH → NodeJS_Downloader_RCE composite | Download tool with remote URL",
+    IsInterpreter == 1 and (HasBase64 == 1 or HasRemoteURL == 1),
+        "HIGH → NodeJS_Interpreter_RCE composite | Interpreter with suspicious flags",
+    IsWinCradle == 1 and HasWinCradleCmd == 1,
+        "HIGH → NodeJS_PowerShell_RCE composite | PowerShell cradle from Node",
+    IsWinLOLBin == 1 and HasRemoteURL == 1,
+        "MEDIUM → NodeJS_LOLBin_RCE composite | LOLBin with remote URL from Node",
+    "MEDIUM → No dedicated composite | Investigate child process manually"
+)
+| summarize arg_max(Timestamp, *) by DeviceId, AccountName, FileName
+| project
+    Timestamp, DeviceName, AccountName,
+    ParentProcess = InitiatingProcessFileName,
+    ChildProcess  = FileName,
+    ProcessCommandLine,
+    RiskScore,
+    IsShell, IsDownloader, IsInterpreter, IsWinCradle,
+    HasReverseShell, HasPipeToShell, HasRemoteURL, HasBase64,
+    RoutingDirective
+| sort by RiskScore desc
