@@ -1,0 +1,71 @@
+// ============================================================================
+// HUNT QUERY: NodeJS_RCE_ChildProcess_Hunt (Cross-Platform)
+// ============================================================================
+// Architecture  : Hunt Query (Architecture 4 — PEAK/TAHITI)
+// PEAK Type     : E — Entity (Intel-Driven)
+// TAHITI Phase  : T4 — Analysis
+// Author        : Ala Dabat | MTDF 2026
+// Platform      : MDE Advanced Hunting
+// MITRE         : T1059.007
+//
+// HYPOTHESIS:
+//   "I hypothesise that Node.js is being abused to spawn shell processes
+//    with reverse shell or remote execution primitives."
+//
+// ⚠ HUNT MODE — NOT FOR PRODUCTION DEPLOYMENT ⚠
+// TIME WINDOW: 14d (use 30d for supply chain investigation)
+// ============================================================================
+
+let lookback = 14d;
+
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| where InitiatingProcessFileName in~ ("node", "node.exe")
+| where FileName in~ (
+    "bash","dash","sh","zsh","fish","busybox",
+    "curl","wget","nc","ncat","socat",
+    "python","python2","python3","perl","ruby","lua",
+    "powershell.exe","pwsh.exe","cmd.exe","wscript.exe",
+    "cscript.exe","certutil.exe","bitsadmin.exe","mshta.exe"
+)
+| extend
+    IsShell       = toint(FileName in~ ("bash","dash","sh","zsh","fish","busybox")),
+    IsDownloader  = toint(FileName in~ ("curl","wget","nc","ncat","socat")),
+    IsInterpreter = toint(FileName in~ ("python","python2","python3","perl","ruby","lua")),
+    IsWindowsBin  = toint(FileName endswith ".exe"),
+    HasDevTcp      = toint(ProcessCommandLine has "/dev/tcp"),
+    HasPipeToShell = toint(ProcessCommandLine matches regex
+                        @"\|\s*(bash|sh|dash|zsh|perl|python|python3)"),
+    HasRemoteURL   = toint(ProcessCommandLine matches regex
+                        @"\b(https?|ftp)://[^\s]+"),
+    HasEncodedCmd  = toint(ProcessCommandLine has_any (
+                        "-enc","-EncodedCommand","base64 -d","base64 --decode")),
+    HasWindowsRCE  = toint(FileName in~ ("powershell.exe","pwsh.exe")
+                        and ProcessCommandLine has_any (
+                            "IEX","Invoke-Expression","DownloadString",
+                            "Invoke-WebRequest","iwr","-ExecutionPolicy Bypass")),
+    IsBuildServer  = toint(InitiatingProcessFolderPath has_any (
+                        "/home/jenkins","/opt/build",
+                        "C:\\ProgramData\\Jenkins","/var/lib/gitlab-runner"))
+| extend HuntSignals = strcat(
+    iif(HasDevTcp == 1,      "[REVERSE_SHELL] ", ""),
+    iif(HasPipeToShell == 1, "[PIPE_TO_SHELL] ", ""),
+    iif(HasRemoteURL == 1,   "[REMOTE_URL] ",   ""),
+    iif(HasEncodedCmd == 1,  "[ENCODED_CMD] ",  ""),
+    iif(HasWindowsRCE == 1,  "[WIN_CRADLE] ",   ""),
+    iif(IsBuildServer == 1,  "[BUILD_SERVER] ", ""),
+    iif(IsShell == 1,        "[SHELL] ",        ""),
+    iif(IsDownloader == 1,   "[DOWNLOADER] ",   ""),
+    iif(IsInterpreter == 1,  "[INTERPRETER] ",  "")
+)
+| project
+    Timestamp, DeviceName, AccountName,
+    ParentProcess     = InitiatingProcessFileName,
+    ParentFolder      = InitiatingProcessFolderPath,
+    ChildProcess      = FileName,
+    ProcessCommandLine,
+    HuntSignals,
+    DeviceId,
+    ChildSHA256       = SHA256,
+    ParentSHA256      = InitiatingProcessSHA256
+| sort by Timestamp desc
