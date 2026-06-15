@@ -1,0 +1,151 @@
+// ============================================================================
+// HUNT QUERY: WebApp_RCE_CrossRuntime_Hunt (All Web Runtimes)
+// ============================================================================
+// Architecture  : Hunt Query (Architecture 4 — PEAK/TAHITI)
+// PEAK Type     : P — Pattern (estate-wide anomaly sweep)
+// TAHITI Phase  : T4 — Analysis
+// Author        : Ala Dabat | MTDF 2026
+// Platform      : MDE Advanced Hunting
+// MITRE         : T1059.004 · T1059.006 · T1059.007 · T1059
+//
+// HYPOTHESIS:
+//   "I hypothesise that web application runtimes (PHP, Python, Java, Node.js)
+//    are being abused to spawn shell processes with remote execution primitives
+//    across the estate — a cross-runtime RCE campaign indicator."
+//
+// WHY A CROSS-RUNTIME HUNT:
+//   Advanced adversaries targeting multiple applications simultaneously
+//   use the same C2 infrastructure but different runtime exploits.
+//   This hunt finds estate-wide patterns that individual composite sensors
+//   would miss by only looking at one runtime at a time.
+//   Convergence across multiple runtimes on the same estate = campaign indicator.
+//
+// ⚠ HUNT MODE — NOT FOR PRODUCTION DEPLOYMENT ⚠
+// TIME WINDOW: 30d (longer window — looking for campaign patterns)
+// SCOPE: All devices — narrow to web/app servers if environment known
+// ============================================================================
+
+let lookback = 30d;
+
+// All web application runtime processes
+let WebRuntimeProcesses = dynamic([
+    // Node.js
+    "node", "node.exe",
+    // PHP
+    "php", "php-fpm", "php-cgi", "php8", "php7", "php.exe",
+    // Python WSGI/ASGI
+    "gunicorn", "uwsgi", "uvicorn", "python3", "python",
+    // Java application servers
+    "java", "java.exe", "javaw.exe"
+]);
+
+// Known-legitimate children across all runtimes
+let LegitChildren = dynamic([
+    "node", "node.exe", "npm", "npx", "yarn",
+    "php", "php.exe", "composer",
+    "python", "python3", "pip", "pip3",
+    "java", "java.exe", "javac", "mvn", "gradle"
+]);
+
+// Dangerous child categories
+let Shells       = dynamic(["bash","dash","sh","zsh","fish","busybox"]);
+let Downloaders  = dynamic(["curl","wget","nc","ncat","socat"]);
+let Interpreters = dynamic(["python","python2","python3","perl","ruby","lua"]);
+let WinChildren  = dynamic([
+    "powershell.exe","pwsh.exe","cmd.exe",
+    "certutil.exe","bitsadmin.exe","mshta.exe"
+]);
+
+let ReverseShellTokens = dynamic([
+    "/dev/tcp/", "exec 5<>", "socket.socket(",
+    "os.dup2(", "subprocess.call("
+]);
+let PipeToShellTokens = dynamic([
+    "| bash", "| sh", "| dash", "| zsh", "| perl", "| python"
+]);
+
+// ── HUNT SURFACE ─────────────────────────────────────────────────────────────
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| where InitiatingProcessFileName in~ (WebRuntimeProcesses)
+| where not(FileName in~ (LegitChildren))
+| where FileName in~ (Shells)
+     or FileName in~ (Downloaders)
+     or FileName in~ (Interpreters)
+     or FileName in~ (WinChildren)
+
+// ── SIGNAL TAGGING ────────────────────────────────────────────────────────────
+// [FIX-8] toint() throughout
+| extend
+    // Runtime classification
+    RuntimeType = case(
+        InitiatingProcessFileName in~ ("node","node.exe"),        "NodeJS",
+        InitiatingProcessFileName in~ ("php","php-fpm","php-cgi","php8","php7","php.exe"), "PHP",
+        InitiatingProcessFileName in~ ("gunicorn","uwsgi","uvicorn","python3","python"),   "Python",
+        InitiatingProcessFileName in~ ("java","java.exe","javaw.exe"),                     "Java",
+        "Unknown"),
+
+    // RCE signals
+    HasDevTcp      = toint(ProcessCommandLine has "/dev/tcp"),
+    HasPipeToShell = toint(ProcessCommandLine has_any (PipeToShellTokens)),
+    HasRemoteURL   = toint(ProcessCommandLine matches regex
+                        @"\b(https?|ftp)://[^\s]+"),
+    HasEncodedCmd  = toint(ProcessCommandLine has_any (
+                        "-enc","-EncodedCommand","base64 -d")),
+    HasWinRCE      = toint(FileName in~ ("powershell.exe","pwsh.exe")
+                        and ProcessCommandLine has_any (
+                            "IEX","DownloadString","Invoke-WebRequest")),
+
+    IsShell      = toint(FileName in~ (Shells)),
+    IsDownloader = toint(FileName in~ (Downloaders)),
+    IsWinChild   = toint(FileName endswith ".exe")
+
+// ── HUNT SIGNAL ASSEMBLY ─────────────────────────────────────────────────────
+| extend HuntSignals = strcat(
+    iif(HasDevTcp == 1,      "[REVERSE_SHELL] ", ""),
+    iif(HasPipeToShell == 1, "[PIPE_TO_SHELL] ", ""),
+    iif(HasRemoteURL == 1,   "[REMOTE_URL] ",   ""),
+    iif(HasEncodedCmd == 1,  "[ENCODED_CMD] ",  ""),
+    iif(HasWinRCE == 1,      "[WIN_CRADLE] ",   ""),
+    iif(IsShell == 1,        "[SHELL] ",        ""),
+    iif(IsDownloader == 1,   "[DOWNLOADER] ",   ""),
+    iif(IsWinChild == 1,     "[WIN_CHILD] ",    "")
+)
+
+// ── CROSS-RUNTIME CAMPAIGN INDICATOR ─────────────────────────────────────────
+// Summarise by device to find hosts with multiple runtime hits
+// Multiple runtimes firing on same device = campaign or mass exploit
+| summarize
+    RuntimesHit    = make_set(RuntimeType, 10),
+    SignalTags     = make_set(HuntSignals, 20),
+    Events         = count(),
+    FirstSeen      = min(Timestamp),
+    LastSeen       = max(Timestamp),
+    CommandLines   = make_set(ProcessCommandLine, 5)
+  by DeviceName, DeviceId, AccountName
+
+| extend
+    RuntimeCount   = array_length(RuntimesHit),
+    IsCampaign     = toint(array_length(RuntimesHit) > 1)
+
+| project
+    DeviceName, AccountName, DeviceId,
+    RuntimeCount, RuntimesHit, IsCampaign,
+    Events, FirstSeen, LastSeen,
+    SignalTags, CommandLines
+| sort by IsCampaign desc, RuntimeCount desc, Events desc
+
+// ── HUNT ANALYST NOTES ────────────────────────────────────────────────────────
+// WHAT TO LOOK FOR:
+//   IsCampaign=1 (RuntimeCount > 1) — same device hit by multiple runtime exploits
+//   This suggests mass exploitation or a sophisticated attacker targeting
+//   multiple applications on the same host simultaneously
+//
+// HIGH PRIORITY:
+//   [REVERSE_SHELL] across any runtime = escalate immediately
+//   RuntimeCount > 1 on production server = campaign indicator
+//
+// PIVOT RECOMMENDATIONS:
+//   IsCampaign hits → pivot DeviceNetworkEvents for shared C2 infrastructure
+//   Compare RemoteIP across all campaign devices to find C2 reuse
+//   AccountName → lateral movement scope after web shell establishment
