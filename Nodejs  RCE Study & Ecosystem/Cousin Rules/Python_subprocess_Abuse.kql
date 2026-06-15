@@ -1,0 +1,199 @@
+// ============================================================================
+// COMPOSITE SENSOR: Python_subprocess_Abuse (Cross-Platform)
+// ============================================================================
+// Architecture  : Composite Sensor (Architecture 1 — Inference: HIGH)
+// Author        : Ala Dabat | MTDF 2026
+// Platform      : MDE Advanced Hunting — Linux + Windows
+// Lifecycle     : Production-Candidate (ADX validation pending)
+// MITRE         : T1059.006 — Python
+// Anchoring     : Intent-First
+// Base          : 55 · Threshold : >= 75
+//
+// MINIMUM TRUTH ANCHOR:
+//   Python web server process (gunicorn, uwsgi, python3 serving web app)
+//   spawning a shell, downloader, or interpreter — the irreducible
+//   Python web application RCE substrate.
+//
+// INDEPENDENT SENSOR: No cross-table joins at Phase 1.
+//   Ghost chains produce false certainty. Independent sensors produce truth.
+//
+// PRIMITIVE BACKING: PC_Python_ChildProcess_Atomic (build alongside)
+//
+// WHY COMPOSITE NOT ROUTER:
+//   Python web server RCE has a SINGLE noise domain: WSGI workers and
+//   data pipeline processes. gunicorn/uwsgi spawning shells is structurally
+//   abnormal. Suppression model is consistent across all child tool types:
+//   web worker process context. Single noise domain = composite.
+//
+//   EXCEPTION: If your environment has heavy data science usage where
+//   Jupyter kernels legitimately spawn subprocesses, consider adding a
+//   Router Rule to separate web server Python from notebook Python.
+//
+// COUSIN SENSORS (web application runtime RCE family):
+//   - NodeJS_SuspiciousChildProcesses (T1059.007) ✅ BUILT
+//   - PHP_exec_Abuse (T1059.004) ✅ BUILT
+//   - Java_Runtime_Exec_Abuse (T1059) 🔴 See cousin rule
+//
+// MINIMUM FIRE PATHS:
+//   Base 55 + HasReverseShell 30  = 85 >= 75 ✓
+//   Base 55 + HasPipeToShell 25   = 80 >= 75 ✓
+//   Base 55 + HasRemoteURL 20     = 75 >= 75 ✓
+// ============================================================================
+
+let lookback = 7d;
+
+// Python web server and application process variants
+let PythonProcesses = dynamic([
+    "python", "python2", "python3",
+    "python2.7", "python3.8", "python3.9", "python3.10", "python3.11",
+    "gunicorn",           // WSGI HTTP server (most common Flask/Django deployment)
+    "uwsgi",              // uWSGI application server
+    "uvicorn",            // ASGI server (FastAPI)
+    "hypercorn",          // ASGI server
+    "daphne",             // Django Channels ASGI
+    "python.exe",         // Windows Python
+    "pythonw.exe"         // Windows Python (no console)
+]);
+
+// Known-legitimate Python children — package/env management
+let LegitPythonChildren = dynamic([
+    "python", "python3", "python.exe",   // Python calling itself
+    "pip", "pip3",                        // Package installation
+    "virtualenv", "venv",
+    "pytest", "py.test",
+    "celery"                              // Task queue worker
+]);
+
+let Shells_Linux       = dynamic(["bash","dash","sh","zsh","fish","busybox"]);
+let Downloaders_Linux  = dynamic(["curl","wget","nc","ncat","socat"]);
+let WinSuspChildren    = dynamic([
+    "powershell.exe","pwsh.exe","cmd.exe",
+    "certutil.exe","bitsadmin.exe","mshta.exe"
+]);
+
+let ReverseShellTokens = dynamic([
+    "/dev/tcp/", "exec 5<>", "socket.socket(",
+    "os.dup2(", "subprocess.call("
+]);
+let PipeToShellTokens = dynamic([
+    "| bash", "| sh", "| dash", "| zsh", "| perl", "| python3"
+]);
+
+// ── PHASE 1: MINIMUM TRUTH ───────────────────────────────────────────────────
+// WHY: gunicorn/uwsgi spawning bash is the irreducible Python web RCE substrate.
+// WSGI workers handle HTTP requests — they spawn Python workers, not shells.
+// Any gunicorn/uwsgi/uvicorn process spawning bash = code execution outside
+// the Python sandbox, typically via os.system() / subprocess with user input.
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| where InitiatingProcessFileName in~ (PythonProcesses)
+| where not(FileName in~ (LegitPythonChildren))
+| where FileName in~ (Shells_Linux)
+     or FileName in~ (Downloaders_Linux)
+     or FileName in~ (WinSuspChildren)
+
+// ── PHASE 2: NATIVE ENRICHMENT ───────────────────────────────────────────────
+// [FIX-8] toint() throughout
+| extend
+    IsLinux   = toint(not(FileName endswith ".exe")),
+    IsWindows = toint(FileName endswith ".exe"),
+
+    // [TECHNIQUE] Reverse shell patterns
+    HasReverseShell  = toint(ProcessCommandLine has_any (ReverseShellTokens)),
+
+    // [TECHNIQUE] Pipe-to-shell
+    HasPipeToShell   = toint(ProcessCommandLine has_any (PipeToShellTokens)),
+
+    // [TECHNIQUE] Remote URL
+    HasRemoteURL     = toint(ProcessCommandLine matches regex
+                         @"\b(https?|ftp)://[^\s'""]+"),
+
+    // [OBFUSCATION] Base64 or encoded
+    HasBase64        = toint(ProcessCommandLine has_any (
+                         "base64 -d", "base64 --decode",
+                         "-enc", "-EncodedCommand")),
+
+    // [TECHNIQUE] Windows PowerShell cradle
+    HasWindowsCradle = toint(FileName in~ ("powershell.exe","pwsh.exe")
+                         and ProcessCommandLine has_any (
+                             "IEX","DownloadString","Invoke-WebRequest",
+                             "iwr","-ExecutionPolicy Bypass")),
+
+    // [TECHNIQUE] Python-specific subprocess invocation patterns
+    // os.system() / subprocess.call() / subprocess.Popen() in parent cmdline
+    HasSubprocessArg = toint(InitiatingProcessCommandLine has_any (
+                         "os.system(", "subprocess.call(",
+                         "subprocess.Popen(", "subprocess.run(",
+                         "commands.getoutput(", "__import__('os')")),
+
+    // [SUPPRESSION] Data science / notebook context — soft penalty
+    // Jupyter kernels legitimately spawn subprocesses in research environments
+    IsDataScienceCtx = toint(
+                         InitiatingProcessFileName in~ ("jupyter", "ipython",
+                             "jupyter-kernel", "ipykernel_launcher")
+                         or InitiatingProcessFolderPath has_any (
+                             "/home/jovyan", "/opt/conda/",
+                             "C:\\Anaconda\\", "C:\\miniconda\\",
+                             "/usr/local/lib/python")
+                         or AccountName has_any (
+                             "jupyter", "jovyan", "notebook-user"))
+
+// ── PHASE 3: CONVERGENCE SCORING ─────────────────────────────────────────────
+// SCORING DECISION TABLE:
+// ┌──────────────────────────┬────────┬──────────────────────────────────────┐
+// │ Signal                   │ Points │ Rationale                            │
+// ├──────────────────────────┼────────┼──────────────────────────────────────┤
+// │ Base (minimum truth)     │   55   │ gunicorn/uwsgi → shell = structural  │
+// │ HasReverseShell          │   30   │ /dev/tcp/ = near-certain C2          │
+// │ HasWindowsCradle         │   30   │ IEX from Python = Windows RCE        │
+// │ HasPipeToShell           │   25   │ Pipe to shell = exec chain           │
+// │ HasRemoteURL             │   20   │ External URL = staging               │
+// │ HasSubprocessArg         │   20   │ os.system() in parent = code sink    │
+// │ HasBase64                │   15   │ Encoded payload                      │
+// │ IsDataScienceCtx(penalty)│  -25   │ Jupyter/Anaconda = legit subprocess  │
+// └──────────────────────────┴────────┴──────────────────────────────────────┘
+| extend RawScore = 55
+    + iff(HasReverseShell == 1,     30, 0)
+    + iff(HasWindowsCradle == 1,    30, 0)
+    + iff(HasPipeToShell == 1,      25, 0)
+    + iff(HasRemoteURL == 1,        20, 0)
+    + iff(HasSubprocessArg == 1,    20, 0)
+    + iff(HasBase64 == 1,           15, 0)
+    - iff(IsDataScienceCtx == 1,    25, 0)
+| extend RiskScore = iif(RawScore < 0, 0, RawScore)
+| where RiskScore >= 75
+
+// ── PHASE 4: HUNTER DIRECTIVE ────────────────────────────────────────────────
+// Schema Confidence: All fields confirmed from MDE DeviceProcessEvents schema.
+// No hallucinated fields.
+| extend HunterDirective = case(
+    RiskScore >= 110,
+        strcat("CRITICAL — PYTHON WEB APP RCE CONFIRMED | ",
+               "WSGI/ASGI worker spawned shell with RCE payload. ",
+               "Score=", tostring(RiskScore), " | ",
+               "ACTIONS: 1. ISOLATE ", DeviceName, " immediately. ",
+               "2. Identify the vulnerable Python web endpoint (Flask/Django route). ",
+               "3. Check for os.system() / subprocess.call() with user input. ",
+               "4. Pivot DeviceNetworkEvents on DeviceId for C2 connections. ",
+               "5. Check requirements.txt for vulnerable third-party packages."),
+    RiskScore >= 90,
+        strcat("HIGH — PYTHON SUBPROCESS ABUSE | Score=", tostring(RiskScore),
+               " | Review parent cmdline for subprocess sink. ",
+               "Check web framework routes for unsanitised input on ", DeviceName),
+    strcat("MEDIUM — PYTHON SPAWNED UNUSUAL PROCESS | Score=", tostring(RiskScore),
+           " | Verify data science / notebook context. ",
+           "If production web server: escalate immediately.")
+)
+| summarize arg_max(Timestamp, *) by DeviceId, AccountName, FileName
+| project
+    Timestamp, DeviceName, AccountName,
+    PythonProcess    = InitiatingProcessFileName,
+    PythonCmdLine    = InitiatingProcessCommandLine,
+    ChildProcess     = FileName,
+    ChildCmdLine     = ProcessCommandLine,
+    RiskScore,
+    HasReverseShell, HasPipeToShell, HasRemoteURL,
+    HasBase64, HasWindowsCradle, HasSubprocessArg,
+    IsDataScienceCtx, IsLinux, IsWindows,
+    HunterDirective
+| sort by RiskScore desc
