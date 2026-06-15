@@ -1,0 +1,45 @@
+// ============================================================================
+// PRIMITIVE COLLECTOR: NodeJS_ChildProcess_Atomic
+// ============================================================================
+// Architecture  : Primitive Collector (Layer 1 — Inference: ZERO)
+// Author        : Ala Dabat | MTDF 2026
+// Platform      : MDE Advanced Hunting — DeviceProcessEvents
+// Lifecycle     : Permanent — 30-day rolling index (silent, no alert)
+// MITRE         : T1059.007 — JavaScript / Node.js
+//
+// INFERENCE DEPTH: ZERO
+//   Claim: "Node.js spawned a child process"
+//   No assertion of intent. No assertion of malice.
+//
+// ENTITY KEYS: DeviceId · DeviceName · AccountName · SHA256
+// COMPOSITE BACKING: NodeJS_SuspiciousChildProcesses
+//
+// NOTE: NO summarise. NO arg_max. NO threshold. ALL rows preserved.
+// ============================================================================
+
+let lookback = 30d;
+
+let LegitNodeChildren = dynamic([
+    "node","node.exe","npm","npm.cmd","npx","npx.cmd",
+    "yarn","git","webpack","webpack.cmd","eslint","ts-node"
+]);
+
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| where InitiatingProcessFileName in~ ("node", "node.exe")
+| where not(FileName in~ (LegitNodeChildren))
+| project
+    Timestamp,
+    DeviceId,
+    DeviceName,
+    AccountName       = coalesce(AccountName, InitiatingProcessAccountName, ""),
+    ParentProcess     = InitiatingProcessFileName,
+    ParentFolder      = InitiatingProcessFolderPath,
+    ParentCmdLine     = InitiatingProcessCommandLine,
+    ParentSHA256      = InitiatingProcessSHA256,
+    ChildProcess      = FileName,
+    ChildCmdLine      = ProcessCommandLine,
+    ChildSHA256       = SHA256,
+    Platform          = iff(FileName endswith ".exe", "Windows", "Linux/Mac"),
+    MITRE             = "T1059.007"
+| sort by Timestamp asc
