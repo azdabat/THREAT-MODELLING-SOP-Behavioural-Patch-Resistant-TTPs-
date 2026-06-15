@@ -1,0 +1,191 @@
+// ============================================================================
+// ROUTER RULE: Java_Runtime_Exec_Abuse
+// ============================================================================
+// Architecture  : Router Rule (Architecture 2 — Triage Surface)
+// Author        : Ala Dabat | MTDF 2026
+// Platform      : MDE Advanced Hunting — Linux + Windows
+// Lifecycle     : Router (Temporary)
+// MITRE         : T1059 — Command and Scripting Interpreter
+// Base          : 0 · Threshold : >= 30
+//
+// WHY ROUTER RULE (not composite):
+//   Java application servers have MULTIPLE radically different noise domains:
+//
+//   java (Tomcat worker) → bash:
+//     Noise: shell scripts invoked by deployment automation
+//     Suppression: svc-deploy / CI pipeline accounts
+//
+//   java (Spring Boot) → powershell.exe:
+//     Noise: Windows build tools, Gradle/Maven tasks
+//     Suppression: build service accounts, developer workstations
+//
+//   java (Elasticsearch/Kafka) → bash:
+//     Noise: cluster management scripts, backup operations
+//     Suppression: elasticsearch / kafka service accounts
+//
+//   java (Jenkins agent) → cmd.exe:
+//     Noise: build pipeline steps — HIGH volume legitimate
+//     Suppression: jenkins service accounts
+//
+//   These noise domains CANNOT share a suppression model.
+//   Combining them would create blind spots that cannot be independently tuned.
+//   Each path requires its own dedicated composite sensor.
+//
+// DECOMPOSITION TRACKER:
+// ┌────────────────────────────┬───────────────────────────┬───────────────────┐
+// │ Technique                  │ Target Composite           │ Status            │
+// ├────────────────────────────┼───────────────────────────┼───────────────────┤
+// │ Tomcat/Spring → bash/sh    │ Java_WebApp_Shell_RCE      │ 🔴 Pending        │
+// │ Tomcat/Spring → curl/wget  │ Java_WebApp_Downloader_RCE │ 🔴 Pending        │
+// │ Spring → powershell.exe    │ Java_Windows_Cradle_RCE    │ 🔴 Pending        │
+// │ Kafka/ES → bash            │ Java_DataPlatform_Shell    │ 🔴 Pending        │
+// │ Jenkins → cmd/bash         │ Retire — Jenkins coverage  │ ⚠️ Exclude via Q8 │
+// └────────────────────────────┴───────────────────────────┴───────────────────┘
+//
+// INDEPENDENT SENSOR: No cross-table joins at Phase 1.
+//   Ghost chains produce false certainty. Independent sensors produce truth.
+//
+// COUSIN SENSORS (web application runtime RCE family):
+//   - NodeJS_SuspiciousChildProcesses (T1059.007) ✅ BUILT
+//   - PHP_exec_Abuse (T1059.004) ✅ BUILT
+//   - Python_subprocess_Abuse (T1059.006) ✅ BUILT
+// ============================================================================
+
+let lookback = 7d;
+
+// Java application process variants
+// Note: 'java' covers Tomcat, Spring Boot, Kafka, Elasticsearch, Jenkins agents
+// The distinction between application types is made in Phase 2 via parent path
+let JavaProcesses = dynamic([
+    "java", "java.exe",
+    "javaw", "javaw.exe"    // Windows Java (no console window)
+]);
+
+// Known-legitimate Java child processes
+let LegitJavaChildren = dynamic([
+    "java", "java.exe",          // JVM forking itself (common in frameworks)
+    "javac",                     // Java compiler
+    "mvn", "mvn.cmd",            // Maven build
+    "gradle", "gradlew",         // Gradle build
+    "jar",                       // JAR tool
+    "keytool"                    // Java keystore management
+]);
+
+let Shells_Linux       = dynamic(["bash","dash","sh","zsh","fish","busybox"]);
+let Downloaders_Linux  = dynamic(["curl","wget","nc","ncat","socat"]);
+let Interpreters_Linux = dynamic(["python","python3","perl","ruby"]);
+let WinSuspChildren    = dynamic([
+    "powershell.exe","pwsh.exe","cmd.exe",
+    "certutil.exe","bitsadmin.exe","mshta.exe","wscript.exe"
+]);
+
+let ReverseShellTokens = dynamic([
+    "/dev/tcp/", "exec 5<>", "socket.socket(",
+    "subprocess.call(", "os.dup2("
+]);
+let PipeToShellTokens = dynamic([
+    "| bash", "| sh", "| dash", "| zsh", "| perl", "| python"
+]);
+
+// ── PHASE 1: BROAD SURFACE FILTER ────────────────────────────────────────────
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| where InitiatingProcessFileName in~ (JavaProcesses)
+| where not(FileName in~ (LegitJavaChildren))
+| where FileName in~ (Shells_Linux)
+     or FileName in~ (Downloaders_Linux)
+     or FileName in~ (Interpreters_Linux)
+     or FileName in~ (WinSuspChildren)
+
+// ── PHASE 2: SIGNAL ENRICHMENT ───────────────────────────────────────────────
+// [FIX-8] toint() throughout
+| extend
+    IsShell       = toint(FileName in~ (Shells_Linux)),
+    IsDownloader  = toint(FileName in~ (Downloaders_Linux)),
+    IsInterpreter = toint(FileName in~ (Interpreters_Linux)),
+    IsWinChild    = toint(FileName endswith ".exe"),
+
+    // RCE signals
+    HasReverseShell  = toint(ProcessCommandLine has_any (ReverseShellTokens)),
+    HasPipeToShell   = toint(ProcessCommandLine has_any (PipeToShellTokens)),
+    HasRemoteURL     = toint(ProcessCommandLine matches regex
+                         @"\b(https?|ftp)://[^\s]+"),
+    HasBase64        = toint(ProcessCommandLine has_any (
+                         "base64 -d", "-enc", "-EncodedCommand")),
+    HasWinCradleCmd  = toint(FileName in~ ("powershell.exe","pwsh.exe")
+                         and ProcessCommandLine has_any (
+                             "IEX","DownloadString","Invoke-WebRequest")),
+
+    // Application type classification via parent process path
+    // Used to route to the correct composite and apply correct suppression
+    IsWebAppServer   = toint(InitiatingProcessFolderPath has_any (
+                         "/opt/tomcat/", "/usr/share/tomcat",
+                         "/opt/wildfly/", "/opt/jboss/",
+                         "C:\\tomcat\\", "C:\\jboss\\")),
+    IsDataPlatform   = toint(InitiatingProcessFolderPath has_any (
+                         "/opt/kafka/", "/opt/elasticsearch/",
+                         "/opt/zookeeper/", "/opt/spark/")),
+    IsJenkinsAgent   = toint(
+                         InitiatingProcessFolderPath has_any (
+                             "/home/jenkins/", "/var/lib/jenkins/",
+                             "C:\\jenkins\\", "C:\\ProgramData\\Jenkins\\")
+                         or AccountName has_any (
+                             "jenkins", "svc-jenkins", "jenkins-agent")),
+    IsBuildTooling   = toint(
+                         InitiatingProcessFileName in~ ("mvn","gradle","gradlew")
+                         or AccountName has_any (
+                             "svc-build", "builduser", "cicd-svc", "svc-deploy"))
+
+// ── PHASE 3: ROUTING SCORE ───────────────────────────────────────────────────
+// Base = 0 — router rules never assert minimum truth on their own
+| extend RawScore = 0
+    + iff(HasReverseShell == 1,   45, 0)
+    + iff(HasPipeToShell == 1,    30, 0)
+    + iff(HasRemoteURL == 1,      25, 0)
+    + iff(HasBase64 == 1,         20, 0)
+    + iff(HasWinCradleCmd == 1,   25, 0)
+    + iff(IsShell == 1,           10, 0)
+    - iff(IsJenkinsAgent == 1,    20, 0)   // Jenkins = high-volume legitimate
+    - iff(IsBuildTooling == 1,    15, 0)   // Build tools = legitimate
+// [FIX-10] Score floor
+| extend RiskScore = iif(RawScore < 0, 0, RawScore)
+| where RiskScore >= 30
+
+// ── PHASE 4: ROUTING DIRECTIVE ───────────────────────────────────────────────
+// [FIX-DIRECTIVE] Defined BEFORE project, included in project list
+// Schema Confidence: All fields confirmed from MDE DeviceProcessEvents schema.
+// No hallucinated fields.
+| extend RoutingDirective = case(
+    HasReverseShell == 1 and IsWebAppServer == 1,
+        strcat("CRITICAL → Java_WebApp_Shell_RCE composite | ",
+               "Tomcat/JBoss reverse shell on ", DeviceName,
+               " | Composite pending — investigate immediately"),
+    HasReverseShell == 1,
+        strcat("CRITICAL → Java_WebApp_Shell_RCE composite | ",
+               "Java reverse shell on ", DeviceName,
+               " | Identify application server type"),
+    IsShell == 1 and (HasPipeToShell == 1 or HasBase64 == 1),
+        "HIGH → Java_WebApp_Shell_RCE composite | Shell with pipe or encoded payload",
+    IsDownloader == 1 and HasRemoteURL == 1,
+        "HIGH → Java_WebApp_Downloader_RCE composite | Download tool with remote URL",
+    IsWinChild == 1 and HasWinCradleCmd == 1,
+        "HIGH → Java_Windows_Cradle_RCE composite | PowerShell cradle from Java",
+    IsDataPlatform == 1 and IsShell == 1,
+        "MEDIUM → Java_DataPlatform_Shell composite | Shell from data platform (Kafka/ES)",
+    IsJenkinsAgent == 1,
+        "LOW → Likely legitimate Jenkins build step — verify pipeline context",
+    "MEDIUM → No dedicated composite | Identify Java application type and escalate"
+)
+| summarize arg_max(Timestamp, *) by DeviceId, AccountName, FileName
+| project
+    Timestamp, DeviceName, AccountName,
+    JavaProcess      = InitiatingProcessFileName,
+    JavaPath         = InitiatingProcessFolderPath,
+    ChildProcess     = FileName,
+    ChildCmdLine     = ProcessCommandLine,
+    RiskScore,
+    IsShell, IsDownloader, IsWinChild,
+    HasReverseShell, HasPipeToShell, HasRemoteURL, HasBase64,
+    IsWebAppServer, IsDataPlatform, IsJenkinsAgent,
+    RoutingDirective
+| sort by RiskScore desc
