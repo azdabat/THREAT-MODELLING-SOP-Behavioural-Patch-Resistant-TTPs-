@@ -1,0 +1,114 @@
+// ============================================================================
+// COMPOSITE SENSOR: NodeJS_SuspiciousChildProcesses (Cross-Platform)
+// ============================================================================
+// Architecture  : Composite Sensor (Architecture 1 — Inference: HIGH)
+// Author        : Ala Dabat | MTDF 2026
+// Platform      : MDE Advanced Hunting — Linux + Windows
+// Lifecycle     : Production-Candidate (ADX validation pending)
+// MITRE         : T1059.007 · T1059.001
+// Anchoring     : Intent-First
+// Base          : 55 · Threshold : >= 75
+//
+// MINIMUM TRUTH: node.exe spawned a shell/downloader/interpreter
+//   WITH RCE-indicative command-line content
+//
+// PRIMITIVE BACKING: NodeJS_ChildProcess_Atomic ✅
+//
+// MINIMUM FIRE PATHS:
+//   Base 55 + HasReverseShell 30  = 85 >= 75 ✓
+//   Base 55 + HasWindowsCradle 30 = 85 >= 75 ✓
+//   Base 55 + HasPipeToShell 25   = 80 >= 75 ✓
+//   Base 55 + HasRemoteURL 20     = 75 >= 75 ✓
+//
+// COUSIN SENSORS (build next):
+//   1. PHP_exec_Abuse (T1059.004)
+//   2. Python_subprocess_Abuse (T1059.006)
+//   3. Java_Runtime_Exec_Abuse (T1059)
+// ============================================================================
+
+let lookback = 7d;
+
+let AllowedChildren = dynamic([
+    "node","node.exe","npm","npm.cmd","npx","npx.cmd",
+    "yarn","git","docker","webpack","eslint","gulp","ts-node","pm2"
+]);
+let Shells_Linux       = dynamic(["bash","dash","sh","zsh","fish","busybox"]);
+let Downloaders_Linux  = dynamic(["curl","wget","nc","ncat","socat"]);
+let Interpreters_Linux = dynamic(["python","python2","python3","perl","ruby","lua"]);
+let WinSuspChildren    = dynamic([
+    "powershell.exe","pwsh.exe","cmd.exe","wscript.exe",
+    "cscript.exe","certutil.exe","bitsadmin.exe","mshta.exe"
+]);
+let ReverseShellTokens = dynamic([
+    "/dev/tcp/","exec 5<>","0<&196;exec 196<>/dev/tcp/",
+    "socket.socket(","subprocess.call(","os.dup2("
+]);
+let PipeToShellTokens = dynamic([
+    "| bash","| sh","| dash","| zsh","| perl","| python","| python3","| lua"
+]);
+
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| where InitiatingProcessFileName in~ ("node", "node.exe")
+| where not(FileName in~ (AllowedChildren))
+| where FileName in~ (Shells_Linux)
+     or FileName in~ (Downloaders_Linux)
+     or FileName in~ (Interpreters_Linux)
+     or FileName in~ (WinSuspChildren)
+| extend
+    IsLinux          = toint(not(FileName endswith ".exe")),
+    IsWindows        = toint(FileName endswith ".exe"),
+    HasReverseShell  = toint(ProcessCommandLine has_any (ReverseShellTokens)),
+    HasPipeToShell   = toint(ProcessCommandLine has_any (PipeToShellTokens)),
+    HasRemoteURL     = toint(ProcessCommandLine matches regex
+                         @"\b(https?|ftp|ftps)://[^\s'""]+"),
+    HasBase64        = toint(ProcessCommandLine has_any (
+                         "-enc","-EncodedCommand","base64 -d","base64 --decode")),
+    HasWindowsCradle = toint(FileName in~ ("powershell.exe","pwsh.exe")
+                         and ProcessCommandLine has_any (
+                             "IEX","Invoke-Expression","New-Object Net.WebClient",
+                             "DownloadString","Invoke-WebRequest","iwr",
+                             "-ExecutionPolicy Bypass")),
+    IsManagedEnv     = toint(
+                         InitiatingProcessFolderPath has_any (
+                             "/home/jenkins","/opt/build/",
+                             "C:\\ProgramData\\Jenkins","/var/lib/gitlab-runner")
+                         or AccountName has_any (
+                             "svc-jenkins","builduser","gitlab-runner","svc-build"))
+| extend RawScore = 55
+    + iff(HasReverseShell == 1,    30, 0)
+    + iff(HasWindowsCradle == 1,   30, 0)
+    + iff(HasPipeToShell == 1,     25, 0)
+    + iff(HasRemoteURL == 1,       20, 0)
+    + iff(HasBase64 == 1,          15, 0)
+    - iff(IsManagedEnv == 1,       25, 0)
+| extend RiskScore = iif(RawScore < 0, 0, RawScore)
+| where RiskScore >= 75
+| extend HunterDirective = case(
+    RiskScore >= 110,
+        strcat("CRITICAL — NODE.JS RCE CONFIRMED | ",
+               iif(IsWindows == 1, "PowerShell cradle from Node.js. ",
+                   "Reverse shell or pipe-to-shell from Node.js. "),
+               "Score=", tostring(RiskScore), " | ",
+               "ACTIONS: 1. ISOLATE ", DeviceName, " immediately. ",
+               "2. Identify vulnerable Node.js endpoint. ",
+               "3. Pivot DeviceNetworkEvents on DeviceId for C2. ",
+               "4. Check DeviceFileEvents for dropped payloads."),
+    RiskScore >= 90,
+        strcat("HIGH — SUSPICIOUS NODE.JS CHILD | Score=", tostring(RiskScore),
+               " | Review command line. Check network connections from ", DeviceName),
+    strcat("MEDIUM — NODE.JS UNUSUAL CHILD | Score=", tostring(RiskScore),
+           " | Verify CI/CD context. Escalate if unexpected.")
+)
+| summarize arg_max(Timestamp, *) by DeviceId, AccountName, FileName
+| project
+    Timestamp, DeviceName, AccountName,
+    ParentProcess    = InitiatingProcessFileName,
+    ChildProcess     = FileName,
+    ProcessCommandLine,
+    RiskScore,
+    HasReverseShell, HasPipeToShell, HasRemoteURL,
+    HasBase64, HasWindowsCradle, IsManagedEnv,
+    IsLinux, IsWindows,
+    HunterDirective
+| sort by RiskScore desc
